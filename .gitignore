@@ -1,0 +1,28 @@
+# Build directories
+Debug/
+Release/
+
+# Generated object files
+*.o
+*.d
+*.su
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+
+# CubeIDE generated temporary files
+*.launch
+
+# CDT indexer/cache
+.settings/language.settings.xml
+
+# Temporary editor files
+*~
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
