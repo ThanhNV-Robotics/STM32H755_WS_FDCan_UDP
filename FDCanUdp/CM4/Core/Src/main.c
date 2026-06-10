@@ -116,8 +116,8 @@ int main(void)
   MX_FDCAN1_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  if (FDCAN1_PingMotors() == 0U)
-      HAL_GPIO_WritePin(LED_Red_GPIO_Port, LED_Red_Pin, GPIO_PIN_SET);
+//  if (FDCAN1_PingMotors() == 0U)
+//      HAL_GPIO_WritePin(LED_Red_GPIO_Port, LED_Red_Pin, GPIO_PIN_SET);
   /* USER CODE END 2 */
 
   /* Infinite loop */

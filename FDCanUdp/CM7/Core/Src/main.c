@@ -18,11 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "lwip.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "udp_comm.h"
+#include "lwip/netif.h"   /* netif_is_link_up() */
+extern struct netif gnetif; /* network interface instance defined in lwip.c */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,7 +40,7 @@
 /*                             demonstration code based on hardware semaphore */
 /* This define is present in both CM7/CM4 projects                            */
 /* To comment when developping/debugging on a single core                     */
-#define DUAL_CORE_BOOT_SYNC_SEQUENCE
+//#define DUAL_CORE_BOOT_SYNC_SEQUENCE
 
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
 #ifndef HSEM_ID_0
@@ -133,7 +136,26 @@ Error_Handler();
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
+
+  /* Initialise the UDP endpoint (bind to port 5005, register RX callback).
+   * Must be called after MX_LWIP_Init() so the LwIP stack is ready. */
+  UDP_Init();
+
+  /* Wait for the Ethernet physical link to come up.
+   * The LAN8742 PHY needs ~1-2 s to auto-negotiate after reset.
+   * MX_LWIP_Process() calls ethernet_link_check_state() internally,
+   * which sets the LwIP link status once the PHY reports link-up.
+   * Without this wait, UDP_Send() fires before the link is ready and
+   * the ARP request for the host MAC is silently dropped. */
+  while (!netif_is_link_up(&gnetif))
+      MX_LWIP_Process();
+
+  /* Test: send one packet on boot so we can verify UDP TX works.
+   * Remove this once confirmed working. */
+  uint8_t testMsg[] = "STM32 alive";
+  UDP_Send(testMsg, sizeof(testMsg) - 1);
 
   /* USER CODE END 2 */
 
@@ -144,6 +166,19 @@ Error_Handler();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    /* Drive the LwIP stack:
+     *  - reads any frame that arrived in the ETH DMA buffer
+     *  - dispatches it to udp_rx_callback() if it matches our port
+     *  - handles LwIP internal timers (ARP refresh, link check, etc.)
+     * Must be called repeatedly — this is the heartbeat of the network stack. */
+    MX_LWIP_Process();
+    HAL_GPIO_WritePin(LED_Red_GPIO_Port, LED_Red_Pin, GPIO_PIN_SET);
+
+//    HAL_GPIO_TogglePin(LED1_Green_GPIO_Port,LED1_Green_Pin);
+//    HAL_GPIO_TogglePin(LED_Red_GPIO_Port,LED_Red_Pin);
+//    HAL_Delay(500);
+
   }
   /* USER CODE END 3 */
 }
@@ -182,7 +217,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOMEDIUM;
-  RCC_OscInitStruct.PLL.PLLFRACN = 3072;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
