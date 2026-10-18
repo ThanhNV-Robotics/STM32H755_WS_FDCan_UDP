@@ -44,7 +44,9 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
 FLASH (rx)     : ORIGIN = 0x08100000, LENGTH = 1024K
-RAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 288K
+/* D2 SRAM1 + SRAM2 only (256K). SRAM3 (0x30040000-0x30047FFF, 32K) is left free for the
+   CM7 Ethernet DMA descriptors and RX buffers - CM4 must not use it. */
+RAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 256K
 }
 
 /* Define output sections */

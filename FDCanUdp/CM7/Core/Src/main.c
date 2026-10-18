@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "lwip.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -142,6 +143,7 @@ Error_Handler();
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
+  MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
   char banner[96];
   int n = snprintf(banner, sizeof(banner),
@@ -157,6 +159,7 @@ Error_Handler();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    MX_LWIP_Process();   /* Ethernet RX, LwIP timers, link state */
     IPC_LogDrain(uart3Out);
   }
   /* USER CODE END 3 */

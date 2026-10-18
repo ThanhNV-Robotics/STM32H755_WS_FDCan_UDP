@@ -335,13 +335,14 @@ static bool updatePipelined(const BenchStep_t* step)
         expected += cyc[l].expected;
     }
 
+    /* Interleave the legs (L0, R0, L1, R1, ...): each queue call takes a few us, so
+     * queueing one whole leg first made the other leg start about 37 us late. */
     uint32_t start = MD_Micros();
     for (uint32_t l = 0; l < NUM_LEGS; l++)
-    {
         cyc[l].lastRxUs = start;
-        for (uint32_t i = 0; i < NUM_MOT; i++)
+    for (uint32_t i = 0; i < NUM_MOT; i++)
+        for (uint32_t l = 0; l < NUM_LEGS; l++)
             if (mdLegs[l].motors[i].enabled) queueCommand(l, i);
-    }
 
     FDCAN_RxHeaderTypeDef h;
     uint8_t d[64];

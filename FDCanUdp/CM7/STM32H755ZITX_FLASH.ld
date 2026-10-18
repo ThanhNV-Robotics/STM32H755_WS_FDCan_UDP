@@ -49,6 +49,9 @@ MEMORY
   DTCMRAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
   RAM_D2 (xrw)   : ORIGIN = 0x30000000, LENGTH = 288K
   RAM_D3 (xrw)   : ORIGIN = 0x38000000, LENGTH = 64K
+  /* D2 SRAM3: Ethernet DMA descriptors + RX buffers. CM4 is limited to SRAM1+2 (256K) so
+     this block is free. CM7 places nothing else in RAM_D2. */
+  RAM_ETH (rw)   : ORIGIN = 0x30040000, LENGTH = 32K
   ITCMRAM (xrw)  : ORIGIN = 0x00000000, LENGTH = 64K
 }
 
@@ -178,6 +181,21 @@ SECTIONS
   } >RAM_D1
 
   /* Remove information from the compiler libraries */
+  /* Ethernet DMA descriptors and the LwIP zero-copy RX pool (ethernetif.c). The ETH DMA
+     cannot reach DTCM, and D-cache is off, so a plain D2 SRAM placement is enough. */
+  .eth_dma (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.RxDescripSection)
+    . = ALIGN(32);
+    *(.TxDescripSection)
+    . = ALIGN(32);
+    *(.Rx_PoolSection)
+  } >RAM_ETH
+  /* 0x30045000-0x30047FFF is the LwIP heap (LWIP_RAM_HEAP_POINTER / MEM_SIZE 8192 in lwipopts.h),
+     used through a pointer, so the linker cannot see it: fail the build if the pool reaches it. */
+  ASSERT(ADDR(.eth_dma) + SIZEOF(.eth_dma) <= 0x30045000, "ETH DMA buffers overlap the LwIP heap at 0x30045000")
+
   /DISCARD/ :
   {
     libc.a ( * )
