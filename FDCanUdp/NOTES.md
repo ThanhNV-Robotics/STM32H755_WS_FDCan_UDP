@@ -6,8 +6,8 @@ Last updated 2026-10-18.
 ## Target
 
 **Control 2 legs at ≥ 1000 Hz:** one leg per CAN FD network, 6 MD drivers per leg.
-- Left leg on FDCAN1, IDs 10–60.
-- Right leg on FDCAN2, IDs to be confirmed.
+- Left leg on FDCAN1 (PD0/PD1): IDs **10, 20, 30, 40, 50, 60**.
+- Right leg on FDCAN2 (PB5/PB6): IDs **70, 80, 90, 100, 110, 120**.
 
 The two FDCAN controllers run in parallel in hardware. If both buses are queued at the start of a cycle, the cycle takes as long as one bus (about 850 µs with FULL frames, 650 µs with TAU), not the sum.
 
@@ -16,7 +16,7 @@ The two FDCAN controllers run in parallel in hardware. If both buses are queued 
 - **Done, works on hardware:** CM4 drives 6 MAB MD drivers (IDs 10–60) over FDCAN1 at 1 Mbps / 8 Mbps BRS. It pings them, enables them in impedance mode with all gains and targets at zero, and runs the full Portenta benchmark (7 steps × 3 s). Then it disables them.
 - **Results match the Portenta** within a few µs (see the table below). The bus is the bottleneck, not the MCU.
 - **PVT misses solved:** MD replies aren't retransmitted after losing arbitration. Ascending-ID queue order + one in-cycle retry gives 0 failed cycles (details below).
-- **FDCAN2 hardware verified** (2026-10-18): the same benchmark on FDCAN2 gives the same results as FDCAN1. Next: run both legs in parallel.
+- **Both legs verified one at a time** (2026-10-18): left leg (FDCAN1, IDs 10–60) and right leg (FDCAN2, IDs 70–120) give the same benchmark results. Next: run both legs in parallel.
 - **Not started:** the UDP side on CM7 (Portenta `M7.ino`) and the command/state exchange between the cores (Portenta `M4.ino`).
 
 ## Hardware
@@ -107,6 +107,21 @@ Protocol rules learned on the Portenta (still apply):
 - Worst case seen: 15 consecutive missed cycles on motor 50 (≈ 11 ms without an update), free-running.
 - Ideas: resend to the missing motors within the same cycle (about 250 µs left at 1 kHz); use FULL or TAU for control; split the motors across FDCAN1 and FDCAN2.
 
+## Is PVT control ready? (assessed 2026-10-18)
+
+**Not yet: stable in the benchmark, not proven for control.**
+
+Shown so far:
+- PVT + retry: 0 failed cycles in about 7,000 cycles (3 s at 1 kHz + 3 s free-run, 6 motors).
+- Cause of the misses understood (reply not retransmitted after losing arbitration). A miss most likely loses only the reply (feedback); the motor still received the command.
+
+Still open before real use:
+1. **Soak test:** 10–30 min at 1 kHz (600k+ cycles), logging worst miss streak, retries per minute, max cycle time. First with zero gains, then with small safe gains and the motors moving (motor-side timing may change under load).
+2. **Control API with retry built in** (per leg: commands in → states out, ascending-ID order, miss counter per motor). The retry only exists in `md_bench.c` so far.
+3. **Failure policy:** what to do after N cycles without feedback from a motor (hold, disable the leg, report a fault).
+4. **PVT has no kp/kd:** the motor keeps the last written gains (currently 0 from the setup). Write kp/kd once (FULL frame or register write) before using PVT, and again on every gain change. If gains change during walking, FULL (850 µs) may be the better choice.
+5. **Both legs in parallel**, then soak test that too.
+
 ## Next steps
 
 1. ~~Regenerate with FDCAN2~~, ~~FDCAN2 startup code~~, ~~FDCAN2 hardware test~~ (done 2026-10-18).
@@ -180,3 +195,26 @@ Newest entries at the bottom. Add one entry per work session: what changed, what
   1. Always queue commands in **ascending CAN ID** order.
   2. Use the **in-cycle retry**: 0 failed cycles, with a retried reply about 200 µs late (max 871 µs, still < 1 ms).
   3. Padding is not a fix by itself (2 misses left, depends on exact timing).
+- Committed as `4fcd4fc`.
+
+### 2026-10-18 — 2-leg wiring, right leg test
+- Assessed PVT readiness: stable in the benchmark, not yet proven for control (see "Is PVT control ready?").
+- Wiring now final: **left leg on FDCAN1, IDs 10–60; right leg on FDCAN2, IDs 70–120.**
+- Added `MD_SetMotorIds()` (motor IDs were hard-coded to 10–60). `MD_PrintConfig()` now logs the bus and the IDs.
+- Test: same benchmark (all 11 steps) on FDCAN2 with the right leg (`MD_SetBus(&hfdcan2)` + `MD_SetMotorIds({70..120})` in CM4 `main.c`).
+  - **Result: right leg works, same as the left leg.** TEC / REC / txFail / rxLost = 0 in every step, all config writes and disables acknowledged.
+
+    | Step | Right leg (avg / max µs, failed) | Left leg (avg / max µs, failed) |
+    |---|---|---|
+    | SEQ FULL 1 kHz | 1252 / 2431, 0 | 1249 / 2389, 0 |
+    | PIPE FULL 1 kHz | 860 / 898, 0 | 852 / 891, 0 |
+    | PIPE PVT 1 kHz | 758 / 794, 19 | 753 / 790, 40 |
+    | PIPE TAU 1 kHz | 658 / 700, 0 | 654 / 696, 0 |
+    | PIPE TAU free-run | 657 / 700, 0 (1515 Hz) | 654 / 697, 1 (1521 Hz) |
+    | PVT pad24 1 kHz | 787 / 823, 2 | 783 / 819, 2 |
+    | PVT reversed | all failed | all failed |
+    | PVT retry 1 kHz | 759 / 869, **0** | 755 / 871, **0** |
+    | PVT retry free-run | 763 / 869, **0** | 758 / 864, **0** |
+
+  - The PVT misses hit **100 and 110**, queue positions 4 and 5. They are different physical motors from 40/50, so this confirms the cause is queue position / reply timing, not specific motors.
+  - Retry: 0 failed cycles; worst reply 869 µs (< 1 ms).

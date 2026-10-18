@@ -119,8 +119,10 @@ int main(void)
   MX_FDCAN1_Init();
   MX_FDCAN2_Init();
   /* USER CODE BEGIN 2 */
-  /* Hardware test: the 6 motors (IDs 10-60) moved from FDCAN1 to FDCAN2 */
+  /* Hardware test: right leg on FDCAN2 */
+  static const uint16_t RIGHT_LEG_IDS[MD_NUM_MOTORS] = {70, 80, 90, 100, 110, 120};
   MD_SetBus(&hfdcan2);
+  MD_SetMotorIds(RIGHT_LEG_IDS);
   MD_Bench_Setup();
   /* USER CODE END 2 */
 

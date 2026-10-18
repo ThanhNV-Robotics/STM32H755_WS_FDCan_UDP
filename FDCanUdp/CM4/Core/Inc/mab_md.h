@@ -74,6 +74,9 @@ extern FDCAN_ErrorCountersTypeDef  mdErrorCounters;
 /* Select the FDCAN controller the motors are on (default &hfdcan1). Call before MD_Bench_Setup(). */
 void                 MD_SetBus(FDCAN_HandleTypeDef* bus);
 FDCAN_HandleTypeDef* MD_Bus(void);
+/* Set the CAN IDs of mdMotors[] (default 10..60) and clear their state. Keep them ascending:
+ * an MD reply that loses arbitration is not retransmitted. */
+void                 MD_SetMotorIds(const uint16_t ids[MD_NUM_MOTORS]);
 
 /* Microsecond timebase from the DWT cycle counter. Call MD_TimeInit() once after
  * HAL_Init(), and MD_Micros() at least every ~17 s (CYCCNT wraps at 200 MHz). */

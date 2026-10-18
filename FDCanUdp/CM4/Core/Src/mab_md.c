@@ -31,6 +31,15 @@ FDCAN_HandleTypeDef* MD_Bus(void)
     return sBus;
 }
 
+void MD_SetMotorIds(const uint16_t ids[MD_NUM_MOTORS])
+{
+    for (uint32_t i = 0; i < MD_NUM_MOTORS; i++)
+    {
+        memset(&mdMotors[i], 0, sizeof(mdMotors[i]));
+        mdMotors[i].canId = ids[i];
+    }
+}
+
 /* ============================================================================
  * Timebase
  * ========================================================================== */
@@ -189,8 +198,11 @@ void MD_PrintConfig(void)
     uint32_t nTq  = 1U + sBus->Init.NominalTimeSeg1 + sBus->Init.NominalTimeSeg2;
     uint32_t dTq  = 1U + sBus->Init.DataTimeSeg1 + sBus->Init.DataTimeSeg2;
     LOG("[CLK] CM4 core %lu Hz, FDCAN kernel %lu Hz", SystemCoreClock, clk);
-    LOG("[CAN] motors on %s", sBus->Instance == FDCAN1 ? "FDCAN1 (PD0 RX / PD1 TX)"
-                            : sBus->Instance == FDCAN2 ? "FDCAN2 (PB5 RX / PB6 TX)" : "?");
+    LOG("[CAN] motors on %s, IDs %u %u %u %u %u %u",
+        sBus->Instance == FDCAN1 ? "FDCAN1 (PD0 RX / PD1 TX)"
+        : sBus->Instance == FDCAN2 ? "FDCAN2 (PB5 RX / PB6 TX)" : "?",
+        mdMotors[0].canId, mdMotors[1].canId, mdMotors[2].canId,
+        mdMotors[3].canId, mdMotors[4].canId, mdMotors[5].canId);
     LOG("[CAN] nominal %lu bps (pre %lu, %lu tq), data %lu bps (pre %lu, %lu tq), started=%s",
         clk / (sBus->Init.NominalPrescaler * nTq), sBus->Init.NominalPrescaler, nTq,
         clk / (sBus->Init.DataPrescaler * dTq), sBus->Init.DataPrescaler, dTq,
