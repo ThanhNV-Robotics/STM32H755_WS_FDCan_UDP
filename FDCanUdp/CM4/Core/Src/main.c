@@ -19,12 +19,13 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "fdcan.h"
-#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "mab_md.h"
+#include "md_bench.h"
+#include "../../../Common/Inc/ipc_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -82,21 +83,21 @@ int main(void)
   /* USER CODE END 1 */
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
-//#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
-//  /*HW semaphore Clock enable*/
-//  __HAL_RCC_HSEM_CLK_ENABLE();
-//  /* Activate HSEM notification for Cortex-M4*/
-//  HAL_HSEM_ActivateNotification(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
-//  /*
-//  Domain D2 goes to STOP mode (Cortex-M4 in deep-sleep) waiting for Cortex-M7 to
-//  perform system initialization (system clock config, external memory configuration.. )
-//  */
-//  HAL_PWREx_ClearPendingEvent();
-//  HAL_PWREx_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFE, PWR_D2_DOMAIN);
-//  /* Clear HSEM flag */
-//  __HAL_HSEM_CLEAR_FLAG(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
-//
-//#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
+  /*HW semaphore Clock enable*/
+  __HAL_RCC_HSEM_CLK_ENABLE();
+  /* Activate HSEM notification for Cortex-M4*/
+  HAL_HSEM_ActivateNotification(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+  /*
+  Domain D2 goes to STOP mode (Cortex-M4 in deep-sleep) waiting for Cortex-M7 to
+  perform system initialization (system clock config, external memory configuration.. )
+  */
+  HAL_PWREx_ClearPendingEvent();
+  HAL_PWREx_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFE, PWR_D2_DOMAIN);
+  /* Clear HSEM flag */
+  __HAL_HSEM_CLEAR_FLAG(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+
+#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 /* USER CODE END Boot_Mode_Sequence_1 */
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -108,16 +109,16 @@ int main(void)
   /* USER CODE END Init */
 
   /* USER CODE BEGIN SysInit */
-
+  MD_TimeInit();
+  LOG("");
+  LOG("=== CM4: FDCAN1 (PD0 RX / PD1 TX) ===");
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_FDCAN1_Init();
-  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  if (FDCAN1_PingMotors() == 0U)
-      HAL_GPIO_WritePin(LED_Red_GPIO_Port, LED_Red_Pin, GPIO_PIN_SET);
+  MD_Bench_Setup();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -131,6 +132,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    MD_Bench_Loop();
   }
   /* USER CODE END 3 */
 }
@@ -146,7 +148,8 @@ int main(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* Look the address up in Debug/FDCanUdp_CM4.list to find the failing call */
+  IPC_Printf("[CM4] Error_Handler called from 0x%08lX\r\n", (uint32_t)__builtin_return_address(0));
   __disable_irq();
   while (1)
   {

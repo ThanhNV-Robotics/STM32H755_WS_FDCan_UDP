@@ -29,3 +29,5 @@ Thumbs.db
 
 #vscode
 .vscode/
+# CubeIDE workspace data
+.metadata/

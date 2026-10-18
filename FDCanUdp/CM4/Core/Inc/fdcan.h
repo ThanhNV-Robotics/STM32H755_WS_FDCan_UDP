@@ -41,7 +41,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 void MX_FDCAN1_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-uint8_t FDCAN1_PingMotors(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
