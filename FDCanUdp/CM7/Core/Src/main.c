@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../../Common/Inc/ipc_log.h"
+#include "lwip/netif.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -70,6 +71,35 @@ void PeriphCommonClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+extern struct netif gnetif;   /* lwip.c */
+
+/* LED_UDP (LD2, PE1): network status
+ *   off             Ethernet link down (no cable / PC port off)
+ *   slow blink 1 Hz link up, no traffic from the PC
+ *   fast blink 10Hz unicast packets from the PC in the last 200 ms (ping now, UDP commands later) */
+static void udpLedUpdate(void)
+{
+  static uint32_t lastToggleMs, lastRxMs, lastRxCount;
+  uint32_t now = HAL_GetTick();
+  uint32_t rx  = ETH->MMCRUPGR;   /* MAC counter: good unicast packets received */
+  if (rx != lastRxCount)
+  {
+    lastRxCount = rx;
+    lastRxMs = now;
+  }
+  if (!netif_is_link_up(&gnetif))
+  {
+    HAL_GPIO_WritePin(LED_UDP_GPIO_Port, LED_UDP_Pin, GPIO_PIN_RESET);
+    return;
+  }
+  uint32_t halfPeriod = (now - lastRxMs < 200U) ? 50U : 500U;
+  if (now - lastToggleMs >= halfPeriod)
+  {
+    lastToggleMs = now;
+    HAL_GPIO_TogglePin(LED_UDP_GPIO_Port, LED_UDP_Pin);
+  }
+}
+
 /* Log sink: everything CM4 writes with LOG() goes out on USART3 (ST-LINK VCP) */
 static void uart3Out(const uint8_t* data, uint32_t len)
 {
@@ -160,6 +190,7 @@ Error_Handler();
 
     /* USER CODE BEGIN 3 */
     MX_LWIP_Process();   /* Ethernet RX, LwIP timers, link state */
+    udpLedUpdate();
     IPC_LogDrain(uart3Out);
   }
   /* USER CODE END 3 */

@@ -399,3 +399,16 @@ Newest entries at the bottom. Add one entry per work session: what changed, what
   - `CM7/LWIP/App/lwip.c`, `USER CODE IP_ADDRESSES`: IP 192.168.10.10, netmask 255.255.255.0, gateway 192.168.10.1 (overrides whatever CubeMX generated).
   - Verified in the CM7 build: only `0x30045000` is referenced, never `0x30004000`.
 - `.gitignore` fixed: the old rule `.settings/language.settings.xml` only matched at the repo root, so both projects' `language.settings.xml` were tracked and changed on every build. Now `**/.settings/language.settings.xml` and `**/.settings/*.prefs`; the two files were untracked (`git rm --cached`, still on disk). `Portenta_H7/` stays untracked (reference only).
+- Committed as `77ce7e1`.
+
+### 2026-10-19 — first ping, network status LED
+- **Ping works** (`ping 192.168.10.10` from the PC). Pitfalls on the way:
+  - The PC's wired port (`enp1s0`) had been given `192.168.10.10`, the Nucleo's address, so the first "replies" came from the PC itself (0.02–0.07 ms, TTL 64; `ip route get` showed `local … dev lo`). PC must be **192.168.10.1/24**. A real reply from the Nucleo has TTL 255.
+  - After fixing the PC address, ARP got no answer until the board was reset; afterwards it worked. Cause unclear (probably the PC port was still being reconfigured); watch for it after fresh flashes.
+  - The RJ45 link LED / "link up 100 Mbit/s" only proves the PHY is powered: the LAN8742 negotiates on its own, even if the STM32 never configures the MAC.
+- **LED_UDP = LD2 on PE1** (yellow on this board), configured on CM7 in CubeMX. `udpLedUpdate()` in CM7 `main.c`:
+  - off = Ethernet link down;
+  - slow blink 1 Hz = link up, no PC traffic;
+  - fast blink 10 Hz = unicast packets from the PC in the last 200 ms (MAC counter `ETH->MMCRUPGR`). After the UDP step this will mean valid command packets.
+- `CM4/.settings/stm32cubeide.project.prefs` untracked (committed before the ignore rule existed).
+- Verified on the board: slow blink when idle, fast blink while pinging.
