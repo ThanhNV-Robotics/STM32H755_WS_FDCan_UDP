@@ -119,10 +119,12 @@ int main(void)
   MX_FDCAN1_Init();
   MX_FDCAN2_Init();
   /* USER CODE BEGIN 2 */
-  /* Hardware test: right leg on FDCAN2 */
-  static const uint16_t RIGHT_LEG_IDS[MD_NUM_MOTORS] = {70, 80, 90, 100, 110, 120};
-  MD_SetBus(&hfdcan2);
-  MD_SetMotorIds(RIGHT_LEG_IDS);
+  /* One leg per CAN FD network. IDs must be ascending: an MD reply that loses
+   * arbitration is not retransmitted. */
+  static const uint16_t LEFT_LEG_IDS[MD_MOTORS_PER_LEG]  = {10, 20, 30, 40, 50, 60};
+  static const uint16_t RIGHT_LEG_IDS[MD_MOTORS_PER_LEG] = {70, 80, 90, 100, 110, 120};
+  MD_LegInit(&mdLegs[0], "L", &hfdcan1, LEFT_LEG_IDS);
+  MD_LegInit(&mdLegs[1], "R", &hfdcan2, RIGHT_LEG_IDS);
   MD_Bench_Setup();
   /* USER CODE END 2 */
 

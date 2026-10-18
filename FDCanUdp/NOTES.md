@@ -16,7 +16,7 @@ The two FDCAN controllers run in parallel in hardware. If both buses are queued 
 - **Done, works on hardware:** CM4 drives 6 MAB MD drivers (IDs 10–60) over FDCAN1 at 1 Mbps / 8 Mbps BRS. It pings them, enables them in impedance mode with all gains and targets at zero, and runs the full Portenta benchmark (7 steps × 3 s). Then it disables them.
 - **Results match the Portenta** within a few µs (see the table below). The bus is the bottleneck, not the MCU.
 - **PVT misses solved:** MD replies aren't retransmitted after losing arbitration. Ascending-ID queue order + one in-cycle retry gives 0 failed cycles (details below).
-- **Both legs verified one at a time** (2026-10-18): left leg (FDCAN1, IDs 10–60) and right leg (FDCAN2, IDs 70–120) give the same benchmark results. Next: run both legs in parallel.
+- **Both legs run in parallel at 1 kHz** (2026-10-18): 12 motors, 0 failed cycles with retry. PVT about 800 µs, TAU about 690 µs, FULL about 914 µs (too tight for a retry). Next: interleave L/R queueing, `-O2`, then the soak test.
 - **Not started:** the UDP side on CM7 (Portenta `M7.ino`) and the command/state exchange between the cores (Portenta `M4.ino`).
 
 ## Hardware
@@ -125,7 +125,9 @@ Still open before real use:
 ## Next steps
 
 1. ~~Regenerate with FDCAN2~~, ~~FDCAN2 startup code~~, ~~FDCAN2 hardware test~~ (done 2026-10-18).
-2. Make `mab_md` work on two buses at once (a motor table per leg, each with its own FDCAN handle), then run the benchmark on both legs in parallel at 1 kHz. Needs the right leg's motor IDs.
+2. ~~Two legs in parallel~~ (done 2026-10-18: 0 failed cycles at 1 kHz with retry).
+3. Cut the cycle time: interleave the L/R queueing (right leg starts about 37 µs late) and build the motor code with `-O2` (about 25 µs CPU overhead per cycle).
+4. Soak test both legs: PVT + retry at 1 kHz for 10–30 min (see "Is PVT control ready?").
 4. ~~Fix the PVT misses~~: solved with ascending-ID order + in-cycle retry (2026-10-18). Use the retry in the 2-leg control loop.
 5. Port the UDP side to CM7 (Portenta `M7.ino`): Ethernet + LwIP on the Nucleo.
 6. Command/state exchange between CM7 and CM4 (Portenta `M4.ino`), for example a second shared-memory channel next to the log buffer in SRAM4.
@@ -218,3 +220,40 @@ Newest entries at the bottom. Add one entry per work session: what changed, what
 
   - The PVT misses hit **100 and 110**, queue positions 4 and 5. They are different physical motors from 40/50, so this confirms the cause is queue position / reply timing, not specific motors.
   - Retry: 0 failed cycles; worst reply 869 µs (< 1 ms).
+- Committed as `b2db0ba`.
+
+### 2026-10-18 — both legs in parallel
+- Refactored `mab_md` for two legs:
+  - Each `MD_Motor_t` carries its FDCAN handle.
+  - `MD_Leg_t` (name, bus, 6 motors, bus diagnostics) is set up with `MD_LegInit()`, in `mdLegs[2]`.
+  - Removed `MD_SetBus`, `MD_SetMotorIds`, `mdMotors[]` and the global diagnostics.
+- Rewrote `md_bench` for two legs:
+  - **PIPE:** queue all 12 commands (ascending ID per leg) on both controllers, then poll both RX FIFOs in one loop. Retry per leg (reply from a later position → resend the earlier missing one; no reply on a leg for 300 µs → resend all its missing ones).
+  - **SEQ:** motor i of both legs at the same time.
+  - Per window: full update time for both legs, plus per leg the "done" time (cycle start → that leg's last reply), TEC/REC/txFail/rxLost, and a line per motor (`L id 10`, `R id 70`).
+  - Dropped the `pad24` / `reversed` experiments. Added retry steps for FULL, PVT and TAU at 1 kHz plus PVT retry free-run (11 steps, about 33 s).
+  - Startup pings both legs before enabling any motor; a leg with missing motors still runs with the ones it has.
+- CM4 `main.c`: `MD_LegInit(&mdLegs[0], "L", &hfdcan1, {10..60})`, `MD_LegInit(&mdLegs[1], "R", &hfdcan2, {70..120})`.
+- **Result: both legs run in parallel at 1 kHz, 0 failed cycles with retry** (log `~/nucleo_two_legs.txt`). 12/12 motors pinged, enabled and disabled; TEC / REC / txFail / rxLost = 0 on both legs.
+
+  | Step | Full update, both legs (avg / p99 / max µs) | Left done avg | Right done avg | Failed |
+  |---|---|---|---|---|
+  | SEQ FULL 1 kHz | 1343 / 1380 / 3680 | – | – | 0 (742 Hz) |
+  | PIPE FULL 1 kHz | 912 / 950 / 945 | 845 | 886 | 0 |
+  | PIPE PVT 1 kHz | 799 / 840 / 832 | 743 | 775 | 28 |
+  | PIPE TAU 1 kHz | 689 / 730 / 730 | 643 | 667 | 0 |
+  | PIPE FULL free-run | 912 / 950 / 946 | 845 | 886 | 0 (1093 Hz) |
+  | PIPE PVT free-run | 801 / 840 / 832 | 746 | 776 | 39 (1225 Hz) |
+  | PIPE TAU free-run | 689 / 730 / 731 | 643 | 667 | 1 (1444 Hz) |
+  | PIPE FULL retry 1 kHz | 914 / 950 / 948 | 846 | 886 | **0** (no retries needed) |
+  | PIPE PVT retry 1 kHz | 802 / 840 / 898 | 744 | 776 | **0** (35 retries, all answered) |
+  | PIPE TAU retry 1 kHz | 691 / 730 / 732 | 644 | 667 | **0** |
+  | PIPE PVT retry free-run | 801 / 840 / 910 | 750 | 774 | **0** (1244 Hz) |
+
+- Findings:
+  - Parallel works: 12 motors take about as long as 6 on one bus (PVT about 800 µs vs 750 µs).
+  - **Right leg starts about 37 µs late** (first reply R70 256 µs vs L10 219 µs): all 6 left commands are queued before the right ones, about 6 µs per `HAL_FDCAN_AddMessageToTxFifoQ` at `-O0`. Fix: interleave the queueing L/R.
+  - **About 25 µs CPU overhead per cycle** (full update 912 vs right done 886). Fix: build the motor code with `-O2`.
+  - **FULL has no room for a retry at 1 kHz** (p99 950 µs, a retry costs about 200 µs). PVT (p99 840, retried max 898) and TAU (730) fit. → For the 1 kHz control loop use PVT or TAU, and write kp/kd only when the gains change.
+  - Without retry, PVT now also misses on left motors 20 and 30 (queue positions 2/3), not just 4/5. Running both buses shifts the timing slightly. The retry covers it; watch it in the soak test.
+- **Repeat run** (log `~/nucleo_two_legs_2.txt`): timings identical within 1–2 µs (FULL 912, PVT 799, TAU 689 µs avg). The PVT miss rate without retry varies between runs (54 vs 28 failed in 3 s); with retry 0 failed again (51 retries, worst reply 910 µs). Bus errors 0. The two-leg timings are a reliable baseline.

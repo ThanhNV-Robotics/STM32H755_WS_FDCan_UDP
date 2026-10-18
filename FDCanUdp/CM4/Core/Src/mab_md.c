@@ -1,5 +1,5 @@
 /**
- * mab_md.c - MAB MD drivers over FDCAN1 (CM4 core)
+ * mab_md.c - MAB MD drivers over FDCAN (CM4 core), one leg per FDCAN controller
  *
  * Port of Portenta_H7/fdcan_udp/fdcan_bench/fdcan_bench.ino (protocol part).
  */
@@ -11,32 +11,18 @@
 #define MD_REPLY_TIMEOUT_US 3000U  /* blocking config transactions */
 #define MD_INTER_FRAME_US   300U   /* MD drops frames arriving right after a reply */
 
-MD_Motor_t mdMotors[MD_NUM_MOTORS] = {
-    {.canId = 10}, {.canId = 20}, {.canId = 30},
-    {.canId = 40}, {.canId = 50}, {.canId = 60},
-};
-FDCAN_ProtocolStatusTypeDef mdProtocolStatus;
-FDCAN_ErrorCountersTypeDef  mdErrorCounters;
+MD_Leg_t mdLegs[MD_NUM_LEGS];
 
-/* FDCAN controller the motors are on (MD_SetBus) */
-static FDCAN_HandleTypeDef* sBus = &hfdcan1;
-
-void MD_SetBus(FDCAN_HandleTypeDef* bus)
+void MD_LegInit(MD_Leg_t* leg, const char* name, FDCAN_HandleTypeDef* bus,
+                const uint16_t ids[MD_MOTORS_PER_LEG])
 {
-    sBus = bus;
-}
-
-FDCAN_HandleTypeDef* MD_Bus(void)
-{
-    return sBus;
-}
-
-void MD_SetMotorIds(const uint16_t ids[MD_NUM_MOTORS])
-{
-    for (uint32_t i = 0; i < MD_NUM_MOTORS; i++)
+    memset(leg, 0, sizeof(*leg));
+    leg->name = name;
+    leg->bus  = bus;
+    for (uint32_t i = 0; i < MD_MOTORS_PER_LEG; i++)
     {
-        memset(&mdMotors[i], 0, sizeof(mdMotors[i]));
-        mdMotors[i].canId = ids[i];
+        leg->motors[i].bus   = bus;
+        leg->motors[i].canId = ids[i];
     }
 }
 
@@ -123,22 +109,22 @@ uint32_t MD_PutReg(uint8_t* buf, uint32_t idx, uint16_t reg, const void* val, ui
     return idx + size;
 }
 
-void MD_FlushRx(void)
+void MD_FlushRx(FDCAN_HandleTypeDef* bus)
 {
     FDCAN_RxHeaderTypeDef h;
     uint8_t d[64];
-    while (HAL_FDCAN_GetRxFifoFillLevel(sBus, FDCAN_RX_FIFO0) > 0U)
-        HAL_FDCAN_GetRxMessage(sBus, FDCAN_RX_FIFO0, &h, d);
+    while (HAL_FDCAN_GetRxFifoFillLevel(bus, FDCAN_RX_FIFO0) > 0U)
+        HAL_FDCAN_GetRxMessage(bus, FDCAN_RX_FIFO0, &h, d);
 }
 
 /* Cancel every TX FIFO request still pending (e.g. retrying because nobody ACKs) */
-void MD_AbortPendingTx(void)
+void MD_AbortPendingTx(FDCAN_HandleTypeDef* bus)
 {
-    HAL_FDCAN_AbortTxRequest(sBus, (1UL << 16) - 1U);   /* all 16 TX elements */
+    HAL_FDCAN_AbortTxRequest(bus, (1UL << 16) - 1U);   /* all 16 TX elements */
 }
 
 /* tx must hold at least the padded DLC size (callers use 8- or 64-byte zeroed buffers) */
-bool MD_SendFrame(uint16_t canId, const uint8_t* tx, uint32_t len)
+bool MD_SendFrame(FDCAN_HandleTypeDef* bus, uint16_t canId, const uint8_t* tx, uint32_t len)
 {
     FDCAN_TxHeaderTypeDef txHeader = {
         .Identifier          = canId,
@@ -151,7 +137,7 @@ bool MD_SendFrame(uint16_t canId, const uint8_t* tx, uint32_t len)
         .TxEventFifoControl  = FDCAN_NO_TX_EVENTS,
         .MessageMarker       = 0,
     };
-    return HAL_FDCAN_AddMessageToTxFifoQ(sBus, &txHeader, (uint8_t*)tx) == HAL_OK;
+    return HAL_FDCAN_AddMessageToTxFifoQ(bus, &txHeader, (uint8_t*)tx) == HAL_OK;
 }
 
 typedef enum
@@ -161,22 +147,22 @@ typedef enum
     MD_XFER_TIMEOUT,   /* no reply from canId */
 } MD_Xfer_E;
 
-/* Blocking MD transaction: send frame to canId, wait for its reply.
+/* Blocking MD transaction: send frame to the motor, wait for its reply.
  * rx must hold 64 bytes. Frames from other IDs are printed and skipped. */
-static MD_Xfer_E md_transact(uint16_t canId, const uint8_t* tx, uint32_t txLen,
+static MD_Xfer_E md_transact(const MD_Motor_t* motor, const uint8_t* tx, uint32_t txLen,
                              uint8_t* rx, uint32_t* rxLen, uint32_t* rttUs)
 {
-    MD_FlushRx();
-    if (!MD_SendFrame(canId, tx, txLen))
+    MD_FlushRx(motor->bus);
+    if (!MD_SendFrame(motor->bus, motor->canId, tx, txLen))
         return MD_XFER_TX_FAIL;
 
     uint32_t start = MD_Micros();
     FDCAN_RxHeaderTypeDef h;
     while ((uint32_t)(MD_Micros() - start) < MD_REPLY_TIMEOUT_US)
     {
-        if (HAL_FDCAN_GetRxFifoFillLevel(sBus, FDCAN_RX_FIFO0) == 0U) continue;
-        if (HAL_FDCAN_GetRxMessage(sBus, FDCAN_RX_FIFO0, &h, rx) != HAL_OK) continue;
-        if (h.Identifier == canId)
+        if (HAL_FDCAN_GetRxFifoFillLevel(motor->bus, FDCAN_RX_FIFO0) == 0U) continue;
+        if (HAL_FDCAN_GetRxMessage(motor->bus, FDCAN_RX_FIFO0, &h, rx) != HAL_OK) continue;
+        if (h.Identifier == motor->canId)
         {
             *rttUs = MD_Micros() - start;
             *rxLen = MD_DlcToBytes(h.DataLength);
@@ -185,47 +171,59 @@ static MD_Xfer_E md_transact(uint16_t canId, const uint8_t* tx, uint32_t txLen,
         LOG("  (foreign frame id=%lu len=%lu: %02X %02X %02X %02X)",
             h.Identifier, MD_DlcToBytes(h.DataLength), rx[0], rx[1], rx[2], rx[3]);
     }
-    MD_AbortPendingTx();
+    MD_AbortPendingTx(motor->bus);
     return MD_XFER_TIMEOUT;
 }
 
 /* ============================================================================
  * Diagnostics
  * ========================================================================== */
+static const char* md_busName(const FDCAN_HandleTypeDef* bus)
+{
+    if (bus->Instance == FDCAN1) return "FDCAN1 (PD0 RX / PD1 TX)";
+    if (bus->Instance == FDCAN2) return "FDCAN2 (PB5 RX / PB6 TX)";
+    return "?";
+}
+
 void MD_PrintConfig(void)
 {
-    uint32_t clk  = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
-    uint32_t nTq  = 1U + sBus->Init.NominalTimeSeg1 + sBus->Init.NominalTimeSeg2;
-    uint32_t dTq  = 1U + sBus->Init.DataTimeSeg1 + sBus->Init.DataTimeSeg2;
+    uint32_t clk = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
     LOG("[CLK] CM4 core %lu Hz, FDCAN kernel %lu Hz", SystemCoreClock, clk);
-    LOG("[CAN] motors on %s, IDs %u %u %u %u %u %u",
-        sBus->Instance == FDCAN1 ? "FDCAN1 (PD0 RX / PD1 TX)"
-        : sBus->Instance == FDCAN2 ? "FDCAN2 (PB5 RX / PB6 TX)" : "?",
-        mdMotors[0].canId, mdMotors[1].canId, mdMotors[2].canId,
-        mdMotors[3].canId, mdMotors[4].canId, mdMotors[5].canId);
-    LOG("[CAN] nominal %lu bps (pre %lu, %lu tq), data %lu bps (pre %lu, %lu tq), started=%s",
-        clk / (sBus->Init.NominalPrescaler * nTq), sBus->Init.NominalPrescaler, nTq,
-        clk / (sBus->Init.DataPrescaler * dTq), sBus->Init.DataPrescaler, dTq,
-        sBus->State == HAL_FDCAN_STATE_BUSY ? "yes" : "NO");
+    for (uint32_t l = 0; l < MD_NUM_LEGS; l++)
+    {
+        const MD_Leg_t*            leg  = &mdLegs[l];
+        const FDCAN_InitTypeDef*   init = &leg->bus->Init;
+        const MD_Motor_t*          m    = leg->motors;
+        uint32_t nTq = 1U + init->NominalTimeSeg1 + init->NominalTimeSeg2;
+        uint32_t dTq = 1U + init->DataTimeSeg1 + init->DataTimeSeg2;
+        LOG("[CAN] leg %s on %s, IDs %u %u %u %u %u %u", leg->name, md_busName(leg->bus),
+            m[0].canId, m[1].canId, m[2].canId, m[3].canId, m[4].canId, m[5].canId);
+        LOG("[CAN]   nominal %lu bps (pre %lu, %lu tq), data %lu bps (pre %lu, %lu tq), started=%s",
+            clk / (init->NominalPrescaler * nTq), init->NominalPrescaler, nTq,
+            clk / (init->DataPrescaler * dTq), init->DataPrescaler, dTq,
+            leg->bus->State == HAL_FDCAN_STATE_BUSY ? "yes" : "NO");
+    }
 }
 
-void MD_UpdateBusDiag(void)
+void MD_UpdateBusDiag(MD_Leg_t* leg)
 {
-    HAL_FDCAN_GetProtocolStatus(sBus, &mdProtocolStatus);
-    HAL_FDCAN_GetErrorCounters(sBus, &mdErrorCounters);
+    HAL_FDCAN_GetProtocolStatus(leg->bus, &leg->protocolStatus);
+    HAL_FDCAN_GetErrorCounters(leg->bus, &leg->errorCounters);
 }
 
-void MD_PrintBusDiag(void)
+void MD_PrintBusDiag(const MD_Leg_t* leg)
 {
+    const FDCAN_ProtocolStatusTypeDef* ps = &leg->protocolStatus;
+    const FDCAN_ErrorCountersTypeDef*  ec = &leg->errorCounters;
     /* LEC: 0 none, 1 stuff, 2 form, 3 ACK, 4 bit1, 5 bit0, 6 CRC, 7 no change */
-    LOG("[DIAG] busOff=%lu errPassive=%lu warn=%lu TEC=%lu REC=%lu LEC=%lu DLEC=%lu",
-        mdProtocolStatus.BusOff, mdProtocolStatus.ErrorPassive, mdProtocolStatus.Warning,
-        mdErrorCounters.TxErrorCnt, mdErrorCounters.RxErrorCnt,
-        mdProtocolStatus.LastErrorCode, mdProtocolStatus.DataLastErrorCode);
-    if (mdProtocolStatus.LastErrorCode == FDCAN_PROTOCOL_ERROR_ACK)
-        LOG("[DIAG] LEC=ACK error: nobody acknowledged (wiring/transceiver/termination/motor power?)");
-    if (mdProtocolStatus.BusOff)
-        LOG("[DIAG] bus-off: controller stopped sending (bit timing or bus short?)");
+    LOG("[DIAG] leg %s: busOff=%lu errPassive=%lu warn=%lu TEC=%lu REC=%lu LEC=%lu DLEC=%lu",
+        leg->name, ps->BusOff, ps->ErrorPassive, ps->Warning, ec->TxErrorCnt, ec->RxErrorCnt,
+        ps->LastErrorCode, ps->DataLastErrorCode);
+    if (ps->LastErrorCode == FDCAN_PROTOCOL_ERROR_ACK)
+        LOG("[DIAG] leg %s: LEC=ACK error: nobody acknowledged (wiring/transceiver/termination/motor power?)",
+            leg->name);
+    if (ps->BusOff)
+        LOG("[DIAG] leg %s: bus-off: controller stopped sending (bit timing or bus short?)", leg->name);
 }
 
 /* ============================================================================
@@ -240,7 +238,7 @@ bool MD_Ping(MD_Motor_t* motor)
 
     motor->alive = false;
     MD_DelayUs(MD_INTER_FRAME_US);
-    MD_Xfer_E res = md_transact(motor->canId, tx, sizeof(tx), rx, &rxLen, &rtt);
+    MD_Xfer_E res = md_transact(motor, tx, sizeof(tx), rx, &rxLen, &rtt);
     if (res == MD_XFER_TX_FAIL)
     {
         LOG("[PING] id %3u : TX FIFO full / FDCAN not started", motor->canId);
@@ -275,13 +273,13 @@ bool MD_Ping(MD_Motor_t* motor)
     return motor->alive;
 }
 
-uint8_t MD_PingAll(void)
+uint8_t MD_PingLeg(MD_Leg_t* leg)
 {
     uint8_t found = 0U;
-    for (uint32_t i = 0; i < MD_NUM_MOTORS; i++)
-        if (MD_Ping(&mdMotors[i]))
+    for (uint32_t i = 0; i < MD_MOTORS_PER_LEG; i++)
+        if (MD_Ping(&leg->motors[i]))
             found++;
-    MD_UpdateBusDiag();
+    MD_UpdateBusDiag(leg);
     return found;
 }
 
@@ -299,7 +297,7 @@ bool MD_WriteRegs(MD_Motor_t* motor, const uint8_t* payload, uint32_t len, const
     memcpy(&tx[2], payload, len);
 
     MD_DelayUs(MD_INTER_FRAME_US);
-    if (md_transact(motor->canId, tx, 2U + len, rx, &rxLen, &rtt) != MD_XFER_OK)
+    if (md_transact(motor, tx, 2U + len, rx, &rxLen, &rtt) != MD_XFER_OK)
     {
         LOG("[CFG] id %3u : %s -> no response", motor->canId, what);
         return false;
@@ -326,7 +324,7 @@ bool MD_ReadReg(MD_Motor_t* motor, uint16_t reg, void* value, uint32_t size)
 
     MD_DelayUs(MD_INTER_FRAME_US);
     /* Like the SDK, don't check rx[0]: fw 2.5.x echoes 0x41, fw 2.4.x replies 0x00. */
-    if (md_transact(motor->canId, tx, 4U + size, rx, &rxLen, &rtt) != MD_XFER_OK)
+    if (md_transact(motor, tx, 4U + size, rx, &rxLen, &rtt) != MD_XFER_OK)
         return false;
     if (rx[0] == MD_FRAME_RESPONSE_ERROR || rx[2] != tx[2] || rx[3] != tx[3])
         return false;
