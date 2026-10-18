@@ -10,7 +10,8 @@
  *   [0] header  [1..2] quickStatus u16  [3] temperature u8
  *   [4..7] position f32  [8..11] velocity f32  [12..15] torque f32
  *
- * Bus: FDCAN1 configured by CubeMX (fdcan.c), 1 Mbps nominal / 8 Mbps data (BRS).
+ * Bus: FDCAN1 or FDCAN2 (MD_SetBus), configured by CubeMX (fdcan.c),
+ * 1 Mbps nominal / 8 Mbps data (BRS).
  */
 #ifndef MAB_MD_H
 #define MAB_MD_H
@@ -69,6 +70,10 @@ typedef struct
 extern MD_Motor_t                  mdMotors[MD_NUM_MOTORS];
 extern FDCAN_ProtocolStatusTypeDef mdProtocolStatus;  /* LastErrorCode 3 = nobody ACKed */
 extern FDCAN_ErrorCountersTypeDef  mdErrorCounters;
+
+/* Select the FDCAN controller the motors are on (default &hfdcan1). Call before MD_Bench_Setup(). */
+void                 MD_SetBus(FDCAN_HandleTypeDef* bus);
+FDCAN_HandleTypeDef* MD_Bus(void);
 
 /* Microsecond timebase from the DWT cycle counter. Call MD_TimeInit() once after
  * HAL_Init(), and MD_Micros() at least every ~17 s (CYCCNT wraps at 200 MHz). */

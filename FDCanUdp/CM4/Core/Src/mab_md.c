@@ -18,6 +18,19 @@ MD_Motor_t mdMotors[MD_NUM_MOTORS] = {
 FDCAN_ProtocolStatusTypeDef mdProtocolStatus;
 FDCAN_ErrorCountersTypeDef  mdErrorCounters;
 
+/* FDCAN controller the motors are on (MD_SetBus) */
+static FDCAN_HandleTypeDef* sBus = &hfdcan1;
+
+void MD_SetBus(FDCAN_HandleTypeDef* bus)
+{
+    sBus = bus;
+}
+
+FDCAN_HandleTypeDef* MD_Bus(void)
+{
+    return sBus;
+}
+
 /* ============================================================================
  * Timebase
  * ========================================================================== */
@@ -105,14 +118,14 @@ void MD_FlushRx(void)
 {
     FDCAN_RxHeaderTypeDef h;
     uint8_t d[64];
-    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U)
-        HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, d);
+    while (HAL_FDCAN_GetRxFifoFillLevel(sBus, FDCAN_RX_FIFO0) > 0U)
+        HAL_FDCAN_GetRxMessage(sBus, FDCAN_RX_FIFO0, &h, d);
 }
 
 /* Cancel every TX FIFO request still pending (e.g. retrying because nobody ACKs) */
 void MD_AbortPendingTx(void)
 {
-    HAL_FDCAN_AbortTxRequest(&hfdcan1, (1UL << 16) - 1U);   /* all 16 TX elements */
+    HAL_FDCAN_AbortTxRequest(sBus, (1UL << 16) - 1U);   /* all 16 TX elements */
 }
 
 /* tx must hold at least the padded DLC size (callers use 8- or 64-byte zeroed buffers) */
@@ -129,7 +142,7 @@ bool MD_SendFrame(uint16_t canId, const uint8_t* tx, uint32_t len)
         .TxEventFifoControl  = FDCAN_NO_TX_EVENTS,
         .MessageMarker       = 0,
     };
-    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, (uint8_t*)tx) == HAL_OK;
+    return HAL_FDCAN_AddMessageToTxFifoQ(sBus, &txHeader, (uint8_t*)tx) == HAL_OK;
 }
 
 typedef enum
@@ -152,8 +165,8 @@ static MD_Xfer_E md_transact(uint16_t canId, const uint8_t* tx, uint32_t txLen,
     FDCAN_RxHeaderTypeDef h;
     while ((uint32_t)(MD_Micros() - start) < MD_REPLY_TIMEOUT_US)
     {
-        if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0U) continue;
-        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, rx) != HAL_OK) continue;
+        if (HAL_FDCAN_GetRxFifoFillLevel(sBus, FDCAN_RX_FIFO0) == 0U) continue;
+        if (HAL_FDCAN_GetRxMessage(sBus, FDCAN_RX_FIFO0, &h, rx) != HAL_OK) continue;
         if (h.Identifier == canId)
         {
             *rttUs = MD_Micros() - start;
@@ -173,19 +186,21 @@ static MD_Xfer_E md_transact(uint16_t canId, const uint8_t* tx, uint32_t txLen,
 void MD_PrintConfig(void)
 {
     uint32_t clk  = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_FDCAN);
-    uint32_t nTq  = 1U + hfdcan1.Init.NominalTimeSeg1 + hfdcan1.Init.NominalTimeSeg2;
-    uint32_t dTq  = 1U + hfdcan1.Init.DataTimeSeg1 + hfdcan1.Init.DataTimeSeg2;
+    uint32_t nTq  = 1U + sBus->Init.NominalTimeSeg1 + sBus->Init.NominalTimeSeg2;
+    uint32_t dTq  = 1U + sBus->Init.DataTimeSeg1 + sBus->Init.DataTimeSeg2;
     LOG("[CLK] CM4 core %lu Hz, FDCAN kernel %lu Hz", SystemCoreClock, clk);
+    LOG("[CAN] motors on %s", sBus->Instance == FDCAN1 ? "FDCAN1 (PD0 RX / PD1 TX)"
+                            : sBus->Instance == FDCAN2 ? "FDCAN2 (PB5 RX / PB6 TX)" : "?");
     LOG("[CAN] nominal %lu bps (pre %lu, %lu tq), data %lu bps (pre %lu, %lu tq), started=%s",
-        clk / (hfdcan1.Init.NominalPrescaler * nTq), hfdcan1.Init.NominalPrescaler, nTq,
-        clk / (hfdcan1.Init.DataPrescaler * dTq), hfdcan1.Init.DataPrescaler, dTq,
-        hfdcan1.State == HAL_FDCAN_STATE_BUSY ? "yes" : "NO");
+        clk / (sBus->Init.NominalPrescaler * nTq), sBus->Init.NominalPrescaler, nTq,
+        clk / (sBus->Init.DataPrescaler * dTq), sBus->Init.DataPrescaler, dTq,
+        sBus->State == HAL_FDCAN_STATE_BUSY ? "yes" : "NO");
 }
 
 void MD_UpdateBusDiag(void)
 {
-    HAL_FDCAN_GetProtocolStatus(&hfdcan1, &mdProtocolStatus);
-    HAL_FDCAN_GetErrorCounters(&hfdcan1, &mdErrorCounters);
+    HAL_FDCAN_GetProtocolStatus(sBus, &mdProtocolStatus);
+    HAL_FDCAN_GetErrorCounters(sBus, &mdErrorCounters);
 }
 
 void MD_PrintBusDiag(void)

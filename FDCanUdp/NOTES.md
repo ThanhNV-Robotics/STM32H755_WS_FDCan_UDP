@@ -15,8 +15,8 @@ The two FDCAN controllers run in parallel in hardware. If both buses are queued 
 
 - **Done, works on hardware:** CM4 drives 6 MAB MD drivers (IDs 10–60) over FDCAN1 at 1 Mbps / 8 Mbps BRS. It pings them, enables them in impedance mode with all gains and targets at zero, and runs the full Portenta benchmark (7 steps × 3 s). Then it disables them.
 - **Results match the Portenta** within a few µs (see the table below). The bus is the bottleneck, not the MCU.
-- **Open issue:** the PVT (20 B) profile loses replies from motors 40 and 50 (details below).
-- **In progress:** FDCAN2 for the second leg. The `.ioc` is configured (see the FDCAN2 settings below); code not regenerated yet.
+- **PVT misses solved:** MD replies aren't retransmitted after losing arbitration. Ascending-ID queue order + one in-cycle retry gives 0 failed cycles (details below).
+- **FDCAN2 hardware verified** (2026-10-18): the same benchmark on FDCAN2 gives the same results as FDCAN1. Next: run both legs in parallel.
 - **Not started:** the UDP side on CM7 (Portenta `M7.ino`) and the command/state exchange between the cores (Portenta `M4.ino`).
 
 ## Hardware
@@ -72,6 +72,7 @@ Protocol rules learned on the Portenta (still apply):
 - Firmware 2.4 silently ignores `0x42`: use `0x40` (WRITE_REGISTER_LEGACY) for all writes. The `0xA0` default response is the acknowledgement.
 - Wait ≥ 300 µs between config frames: an MD drops a frame that arrives right after it sent a reply.
 - CAN watchdog is 100 ms (fw 2.4) / 200 ms (fw 2.5.4): never pause longer while motors are enabled.
+- **An MD does not retransmit a reply that loses arbitration** (found 2026-10-18). If a lower-ID frame starts at the same moment, the reply is lost. So: queue commands in ascending ID order (reversed order loses almost every reply), and resend once to a motor whose reply is missing (see the PVT-miss experiments in the dev log).
 
 ## How to build, flash, watch
 
@@ -97,7 +98,9 @@ Protocol rules learned on the Portenta (still apply):
 - TEC / REC / txFail / rxLost = 0 in every step.
 - Per-motor PIPE latency (TAU): 158, 220, 365, 432, 576, 642 µs. Replies arrive in CAN ID order.
 
-## Open issue: PVT misses on motors 40 and 50
+## Solved issue: PVT misses on motors 40 and 50
+
+**Solved 2026-10-18:** MD replies are not retransmitted after losing arbitration. The fix is ascending-ID queue order plus one in-cycle retry. Details in the dev log ("PVT-miss experiments"). Original analysis below.
 
 - Only the PVT profile (20 B), only motors 40 and 50 (fw 2.4.0 / 2.4.1). FULL and TAU have zero or almost zero misses. The Portenta shows the same.
 - Each miss is a 2 ms timeout: the reply never arrives. The likely cause is the "MD drops a frame right after a reply" behaviour, hit by the PVT timing.
@@ -106,10 +109,9 @@ Protocol rules learned on the Portenta (still apply):
 
 ## Next steps
 
-1. Regenerate the code with FDCAN2. Then check that the SMPS define is still in both `.cproject` files and that the FDCAN1 USER CODE survived.
-2. Add FDCAN2's startup code in `fdcan.c` USER CODE (transmitter delay compensation, accept-all filter, start), as for FDCAN1.
-3. Make `mab_md` work on two buses (a bus handle per motor or per leg), then run the benchmark on both legs in parallel at 1 kHz.
-4. Fix the PVT misses (in-cycle retry), or decide to use FULL/TAU only.
+1. ~~Regenerate with FDCAN2~~, ~~FDCAN2 startup code~~, ~~FDCAN2 hardware test~~ (done 2026-10-18).
+2. Make `mab_md` work on two buses at once (a motor table per leg, each with its own FDCAN handle), then run the benchmark on both legs in parallel at 1 kHz. Needs the right leg's motor IDs.
+4. ~~Fix the PVT misses~~: solved with ascending-ID order + in-cycle retry (2026-10-18). Use the retry in the 2-leg control loop.
 5. Port the UDP side to CM7 (Portenta `M7.ino`): Ethernet + LwIP on the Nucleo.
 6. Command/state exchange between CM7 and CM4 (Portenta `M4.ino`), for example a second shared-memory channel next to the log buffer in SRAM4.
 7. Clean up: `CM4/Core/Src/mab_can.c/.h` and the CM7 copies are no longer used.
@@ -135,4 +137,46 @@ Newest entries at the bottom. Add one entry per work session: what changed, what
 - Target set: 2 legs, one CAN FD network each, ≥ 1000 Hz.
 - Added FDCAN2 in the `.ioc` on CM4, PB5 (RX) / PB6 (TX), same timing and FIFOs as FDCAN1.
 - Two settings had to be fixed in CubeMX: Frame Format was `FD_NO_BRS` (now `FD_BRS`), and Message Ram Offset was 0, overlapping FDCAN1 (now 576).
-- Code not regenerated yet.
+- Checkpoint commit **`c6d2fde`** made before regenerating. If the regenerate breaks something, restore a file with `git checkout c6d2fde -- <path>`.
+- Regenerated. Everything survived: SMPS, HSE bypass, boot sync, USER CODE.
+  - CubeMX moved the PLL2 / FDCAN kernel clock setup from `HAL_FDCAN_MspInit` (CM4) to a new `PeriphCommonClock_Config()` in CM7's `main.c`. CM7 runs it before waking CM4. CM4 gets an unused copy.
+  - The FDCAN clock enable is now reference-counted in `fdcan.c` (shared by FDCAN1 and FDCAN2).
+- Added FDCAN2 startup in `fdcan.c` USER CODE (TDC, accept-all filter, start), as for FDCAN1.
+- `mab_md` / `md_bench` no longer use `hfdcan1` directly: `MD_SetBus(&hfdcan2)` selects the controller, and `MD_PrintConfig()` logs which one.
+- Hardware test: the same 6 motors (IDs 10–60) moved to FDCAN2, benchmark run on FDCAN2 (`MD_SetBus(&hfdcan2)` in CM4 `main.c`).
+  - **Result: FDCAN2 works.** All 6 pinged and enabled; TEC / REC / txFail / rxLost = 0 in every step; timings match FDCAN1 within a few µs.
+
+    | Step | FDCAN2 avg / p99 / max (µs) | Rate |
+    |---|---|---|
+    | SEQ FULL 1 kHz | 1249 / 1300 / 2389 | 798 Hz |
+    | PIPE FULL 1 kHz | 852 / 890 / 891 | 1000 Hz |
+    | PIPE PVT 1 kHz | 750 / 790 / 786 | 996 Hz (32 failed) |
+    | PIPE TAU 1 kHz | 651 / 690 / 692 | 1000 Hz |
+    | PIPE FULL free-run | 849 / 880 / 880 | 1174 Hz |
+    | PIPE PVT free-run | 753 / 790 / 786 | 1305 Hz (31 failed) |
+    | PIPE TAU free-run | 651 / 690 / 693 | 1529 Hz |
+
+  - The PVT misses on motors 40 and 50 appear on FDCAN2 too (max 4 in a row). Same motors on FDCAN1, FDCAN2 and the Portenta, so it's how those motors behave, not the bus.
+
+### 2026-10-18 — PVT-miss experiments
+- Evidence so far: only PVT (20 B) misses, only motors 40 and 50 (queue positions 4 and 5), `invalid 0`, no bus errors. Motor 30 has the same firmware as 40 and never misses. Working theory: an MD drops a frame that arrives right after it sent a reply, and with 20-byte frames the commands for 40/50 land in that window.
+- Added 4 benchmark steps (after the original 7, so the run now takes about 35 s):
+  - `PIPE PVT pad24 1000 us`: same content zero-padded to 24 bytes. Misses gone or moved → it's frame timing.
+  - `PIPE PVT reversed 1000 us`: queue 60 → 10. Misses move to other queue positions → it's position, not motors 40/50.
+  - `PIPE PVT retry 1000 us` and `retry free-run`: resend once to a motor whose reply is missing. Replies arrive in queue order, so a reply from a later position means an earlier command was dropped → resend at once. Fallback: no reply for 300 µs → resend to everyone still missing. Logged per motor as "retried N, answered after retry M".
+- Result (FDCAN2, log `~/nucleo_fdcan2.txt`):
+
+  | Step | Failed cycles | Motor 40 / 50 missed | Avg / max (µs) |
+  |---|---|---|---|
+  | PVT 1 kHz (baseline) | 40 | 17 / 23 | 753 / 790 |
+  | PVT free-run (baseline) | 116 | 75 / 41 (max 16 in a row) | 756 / 790 |
+  | PVT pad24 1 kHz | 2 | 0 / 2 | 783 / 819 |
+  | PVT reversed 1 kHz | 1490 (all) | 60/50/40 never answered, 30 almost never | — |
+  | PVT retry 1 kHz | **0** | 8 / 7 retried, all answered | 755 / 871 |
+  | PVT retry free-run | **0** | 13 / 14 retried, all answered | 758 / 864 |
+
+- **Cause found: the MD drivers do not retransmit a reply that loses arbitration.** Reversed order proves it: while lower-ID commands are still queued, every reply from a higher ID loses and is dropped (60, 50, 40 never answered; the lower the ID, the fewer losses). In normal order, PVT timing makes motor 40/50's reply start at the same moment as a lower-ID frame. Padding to 24 bytes shifts the timing and removes most collisions.
+- **Decisions for the control loop:**
+  1. Always queue commands in **ascending CAN ID** order.
+  2. Use the **in-cycle retry**: 0 failed cycles, with a retried reply about 200 µs late (max 871 µs, still < 1 ms).
+  3. Padding is not a fix by itself (2 misses left, depends on exact timing).

@@ -9,6 +9,9 @@
  *      PIPE: queue all frames into the TX FIFO at once, then collect replies
  *      Profiles: FULL (pos,vel,tau,kp,kd 32 B), PVT (pos,vel,tau 20 B), TAU (8 B)
  *      Period: 1000 us (1 kHz) or free-run
+ *   4. PVT-miss experiments (motors 40/50 sometimes don't answer PVT frames):
+ *      pad24 (same content, 24-byte frame), reversed (queue 60 -> 10),
+ *      retry (resend once to a motor whose reply is missing), at 1 kHz and free-run
  *
  * LEDs (Nucleo): green blinking = running OK, red blinking = motor missing / missed
  * replies, both off = test finished, motors disabled.

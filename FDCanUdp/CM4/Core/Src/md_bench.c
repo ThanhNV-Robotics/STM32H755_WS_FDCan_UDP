@@ -15,6 +15,7 @@
 #define UPDATE_TIMEOUT_US 2000U   /* one full 0x40 update cycle */
 #define WINDOW_MS         3000U   /* duration of each benchmark step */
 #define LED_BLINK_MS      250U
+#define RETRY_IDLE_US     300U    /* no reply for this long -> resend to the motors still missing */
 
 /* Impedance command sent every cycle. All zero -> drive outputs no torque. */
 static const float CMD_POS = 0.0f, CMD_VEL = 0.0f, CMD_TAU = 0.0f;
@@ -33,16 +34,26 @@ typedef struct
     bool         pipelined;
     CmdProfile_E profile;
     uint32_t     periodUs;   /* 0 = free-run (next cycle starts as soon as the last one ends) */
+    /* PVT-miss experiments (PIPE only, 0 / false = off) */
+    uint8_t      padTo;      /* zero-pad the command frame to this many bytes (MD stops at reg 0x0000) */
+    bool         reversed;   /* queue the commands 60 -> 10 instead of 10 -> 60 */
+    bool         retry;      /* resend once to a motor whose reply is missing */
 } BenchStep_t;
 
 static const BenchStep_t BENCH[] = {
-    {false, PROFILE_FULL, 1000},
-    {true,  PROFILE_FULL, 1000},
-    {true,  PROFILE_PVT,  1000},
-    {true,  PROFILE_TAU,  1000},
-    {true,  PROFILE_FULL, 0},
-    {true,  PROFILE_PVT,  0},
-    {true,  PROFILE_TAU,  0},
+    /* pipelined, profile, periodUs, padTo, reversed, retry */
+    {false, PROFILE_FULL, 1000, 0,  false, false},
+    {true,  PROFILE_FULL, 1000, 0,  false, false},
+    {true,  PROFILE_PVT,  1000, 0,  false, false},
+    {true,  PROFILE_TAU,  1000, 0,  false, false},
+    {true,  PROFILE_FULL, 0,    0,  false, false},
+    {true,  PROFILE_PVT,  0,    0,  false, false},
+    {true,  PROFILE_TAU,  0,    0,  false, false},
+    /* PVT-miss experiments: is it frame timing, queue position, and does a retry fix it? */
+    {true,  PROFILE_PVT,  1000, 24, false, false},
+    {true,  PROFILE_PVT,  1000, 0,  true,  false},
+    {true,  PROFILE_PVT,  1000, 0,  false, true},
+    {true,  PROFILE_PVT,  0,    0,  false, true},
 };
 #define NUM_STEPS (sizeof(BENCH) / sizeof(BENCH[0]))
 
@@ -54,6 +65,8 @@ typedef struct
     uint32_t consecMissed, maxConsecMissed;
     uint32_t invalid;           /* reply with wrong header / length */
     uint32_t latSum, latN, latMax;
+    uint32_t retries;           /* commands sent a second time */
+    uint32_t recovered;         /* ... and answered after the resend */
 } MotorStats_t;
 static MotorStats_t mstats[MD_NUM_MOTORS];
 
@@ -148,7 +161,7 @@ static uint32_t updateFrameLen = 0;
 static uint32_t txFailures = 0;   /* TX FIFO full / HAL error */
 static uint32_t rxLost     = 0;   /* RX FIFO overflow (message lost) */
 
-static void buildUpdateFrame(CmdProfile_E profile)
+static void buildUpdateFrame(CmdProfile_E profile, uint32_t padTo)
 {
     uint32_t n = 0;
     memset(updateFrame, 0, sizeof(updateFrame));
@@ -165,7 +178,8 @@ static void buildUpdateFrame(CmdProfile_E profile)
         n = MD_PutReg(updateFrame, n, MD_REG_IMP_KP, &CMD_KP, 4);
         n = MD_PutReg(updateFrame, n, MD_REG_IMP_KD, &CMD_KD, 4);
     }
-    updateFrameLen = n;
+    /* frame is zeroed: padding reads as register 0x0000, where the MD stops parsing */
+    updateFrameLen = (padTo > n && padTo <= sizeof(updateFrame)) ? padTo : n;
 }
 
 /* Dump the first reply of each motor raw so it can be checked against the hardware */
@@ -208,9 +222,9 @@ static void queueCommand(uint32_t i)
 
 static void checkRxOverflow(void)
 {
-    if (__HAL_FDCAN_GET_FLAG(&hfdcan1, FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST))
+    if (__HAL_FDCAN_GET_FLAG(MD_Bus(), FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST))
     {
-        __HAL_FDCAN_CLEAR_FLAG(&hfdcan1, FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST);
+        __HAL_FDCAN_CLEAR_FLAG(MD_Bus(), FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST);
         rxLost++;
     }
 }
@@ -238,8 +252,8 @@ static bool updateSequential(void)
         bool got = false;
         while (!got && (uint32_t)(MD_Micros() - start) < UPDATE_TIMEOUT_US)
         {
-            if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0U) continue;
-            if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, d) != HAL_OK) continue;
+            if (HAL_FDCAN_GetRxFifoFillLevel(MD_Bus(), FDCAN_RX_FIFO0) == 0U) continue;
+            if (HAL_FDCAN_GetRxMessage(MD_Bus(), FDCAN_RX_FIFO0, &h, d) != HAL_OK) continue;
             got = (acceptReply(&h, d, MD_Micros() - start) == (int)i);
         }
         if (!got) { allOk = false; MD_AbortPendingTx(); }
@@ -249,29 +263,63 @@ static bool updateSequential(void)
     return allOk;
 }
 
-/* PIPE: queue every command, then collect. Latency = cycle start -> that motor's reply.
- * Needs automatic retransmission: commands lose arbitration to replies. */
-static bool updatePipelined(void)
+/* Resend once to every motor in queue positions [0, upTo) that has not answered yet */
+static void retryMissing(const uint8_t* order, uint32_t upTo, const bool* got, bool* retried)
 {
-    bool got[MD_NUM_MOTORS] = {false};
+    for (uint32_t q = 0; q < upTo; q++)
+    {
+        uint32_t i = order[q];
+        if (got[i] || retried[i]) continue;
+        retried[i] = true;
+        mstats[i].retries++;
+        queueCommand(i);
+    }
+}
+
+/* PIPE: queue every command, then collect. Latency = cycle start -> that motor's reply.
+ * Needs automatic retransmission: commands lose arbitration to replies.
+ * With step->retry: replies arrive in queue order, so a reply from position p while an
+ * earlier position is still missing means that command was dropped -> resend it now.
+ * The last positions are covered by a timeout (no reply for RETRY_IDLE_US). */
+static bool updatePipelined(const BenchStep_t* step)
+{
+    bool     got[MD_NUM_MOTORS]     = {false};
+    bool     retried[MD_NUM_MOTORS] = {false};
+    uint8_t  order[MD_NUM_MOTORS];   /* queue position -> motor index */
+    uint8_t  pos[MD_NUM_MOTORS];     /* motor index -> queue position */
     uint32_t expected = 0, received = 0;
+    for (uint32_t k = 0; k < MD_NUM_MOTORS; k++)
+    {
+        uint32_t i = step->reversed ? MD_NUM_MOTORS - 1U - k : k;
+        if (!mdMotors[i].enabled) continue;
+        pos[i] = (uint8_t)expected;
+        order[expected++] = (uint8_t)i;
+    }
+
     MD_FlushRx();
     uint32_t start = MD_Micros();
-    for (uint32_t i = 0; i < MD_NUM_MOTORS; i++)
-    {
-        if (!mdMotors[i].enabled) continue;
-        queueCommand(i);
-        expected++;
-    }
+    for (uint32_t q = 0; q < expected; q++)
+        queueCommand(order[q]);
 
     FDCAN_RxHeaderTypeDef h;
     uint8_t d[64];
+    uint32_t lastRxUs = start;
     while (received < expected && (uint32_t)(MD_Micros() - start) < UPDATE_TIMEOUT_US)
     {
-        if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0U) continue;
-        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, d) != HAL_OK) continue;
+        if (step->retry && (uint32_t)(MD_Micros() - lastRxUs) >= RETRY_IDLE_US)
+        {
+            retryMissing(order, expected, got, retried);
+            lastRxUs = MD_Micros();
+        }
+        if (HAL_FDCAN_GetRxFifoFillLevel(MD_Bus(), FDCAN_RX_FIFO0) == 0U) continue;
+        if (HAL_FDCAN_GetRxMessage(MD_Bus(), FDCAN_RX_FIFO0, &h, d) != HAL_OK) continue;
         int i = acceptReply(&h, d, MD_Micros() - start);
-        if (i >= 0 && !got[i]) { got[i] = true; received++; }
+        if (i < 0 || got[i]) continue;
+        got[i] = true;
+        received++;
+        lastRxUs = MD_Micros();
+        if (retried[i]) mstats[i].recovered++;
+        if (step->retry) retryMissing(order, pos[i], got, retried);
     }
     if (received < expected) MD_AbortPendingTx();
     for (uint32_t i = 0; i < MD_NUM_MOTORS; i++)
@@ -287,8 +335,13 @@ static void printWindow(const BenchStep_t* step, const CycleStats_t* s, uint32_t
     if (step->periodUs) snprintf(period, sizeof(period), "%lu us", step->periodUs);
     else                snprintf(period, sizeof(period), "free-run");
 
-    LOG("[%s %s %s] %lu Hz  cycles %lu  failed %lu  over-period %lu",
-        step->pipelined ? "PIPE" : "SEQ ", PROFILE_NAMES[step->profile], period,
+    char variant[32] = "";
+    if (step->padTo)    snprintf(variant, sizeof(variant), " pad%u", step->padTo);
+    if (step->reversed) strncat(variant, " reversed", sizeof(variant) - strlen(variant) - 1U);
+    if (step->retry)    strncat(variant, " retry", sizeof(variant) - strlen(variant) - 1U);
+
+    LOG("[%s %s%s %s] %lu Hz  cycles %lu  failed %lu  over-period %lu",
+        step->pipelined ? "PIPE" : "SEQ ", PROFILE_NAMES[step->profile], variant, period,
         windowMs ? (s->n * 1000U + windowMs / 2U) / windowMs : 0U, s->n, s->failed, s->overPeriod);
     LOG("   full update: avg %lu us  min %lu  p99 %lu  max %lu",
         ok ? s->sumUs / ok : 0U, ok ? s->minUs : 0U, stats_percentile(s, 99), s->maxUs);
@@ -307,6 +360,8 @@ static void printWindow(const BenchStep_t* step, const CycleStats_t* s, uint32_t
             m->canId, ms->latN ? ms->latSum / ms->latN : 0U, ms->latMax, ms->missed,
             ms->maxConsecMissed, ms->invalid, m->quickStatus, m->temperature,
             fmt4(p, m->pos), fmt4(v, m->vel), fmt4(t, m->tau));
+        if (step->retry && ms->retries)
+            LOG("            retried %lu, answered after retry %lu", ms->retries, ms->recovered);
     }
 }
 
@@ -319,6 +374,7 @@ static void resetWindowCounters(CycleStats_t* s)
         MotorStats_t* m = &mstats[i];
         m->missed = m->maxConsecMissed = m->consecMissed = m->invalid = 0;
         m->latSum = m->latN = m->latMax = 0;
+        m->retries = m->recovered = 0;
     }
 }
 
@@ -346,7 +402,7 @@ static uint32_t windowStartMs, nextCycleUs;
 static void startStep(uint32_t idx)
 {
     stepIdx = idx;
-    buildUpdateFrame(BENCH[idx].profile);
+    buildUpdateFrame(BENCH[idx].profile, BENCH[idx].padTo);
     stats.periodUs = BENCH[idx].periodUs;
     resetWindowCounters(&stats);
     windowStartMs = HAL_GetTick();
@@ -397,7 +453,7 @@ void MD_Bench_Loop(void)
     }
 
     uint32_t t0 = MD_Micros();
-    bool ok = step->pipelined ? updatePipelined() : updateSequential();
+    bool ok = step->pipelined ? updatePipelined(step) : updateSequential();
     stats_add(&stats, MD_Micros() - t0, ok);
 
     uint32_t now = HAL_GetTick();
