@@ -28,7 +28,31 @@
 #include "ethernetif.h"
 
 /* USER CODE BEGIN 0 */
+/* TX bookkeeping fix for the CubeMX NO_SYS port.
+ * low_level_output() sends with the blocking HAL_ETH_Transmit(). That function never sets
+ * TxDescList.CurrentPacketAddress (only HAL_ETH_Transmit_IT() does), so PacketAddress[] stays
+ * NULL, HAL_ETH_ReleaseTxPacket() can never release anything, and ETH_Prepare_Tx_Descriptors()
+ * adds +1 to TxDescList.BuffersInUse for every frame. Calling ReleaseTxPacket() then loops
+ * BuffersInUse times per call (measured: one send grew from 20 us to several ms, then stalls of
+ * seconds). The blocking send has finished with its descriptor when it returns, so reset the
+ * counter instead. HAL_ETH_TxFreeCallback (ethernetif.c) stays a no-op: lwIP frees the pbuf. */
+extern ETH_HandleTypeDef heth;   /* ethernetif.c */
+static netif_linkoutput_fn sLowLevelOutput;
 
+/* DIAG: worst-case cycle counts (400 MHz), printed and reset by CM7 main.c */
+volatile uint32_t lwipDiagTxMax, lwipDiagRxMax, lwipDiagTmrMax;
+volatile uint32_t lwipRxDmaKicks;   /* RX DMA restarts after "receive buffer unavailable" */
+static uint32_t sDiagT0;
+
+static err_t linkOutputAndRelease(struct netif *netif, struct pbuf *p)
+{
+  uint32_t t = DWT->CYCCNT;
+  err_t err = sLowLevelOutput(netif, p);   /* blocking: returns when the DMA has sent it */
+  heth.TxDescList.BuffersInUse = 0U;
+  t = DWT->CYCCNT - t;
+  if (t > lwipDiagTxMax) lwipDiagTxMax = t;
+  return err;
+}
 /* USER CODE END 0 */
 /* Private function prototypes -----------------------------------------------*/
 static void ethernet_link_status_updated(struct netif *netif);
@@ -102,7 +126,9 @@ void MX_LWIP_Init(void)
   netif_set_link_callback(&gnetif, ethernet_link_status_updated);
 
 /* USER CODE BEGIN 3 */
-
+  /* see USER CODE 0: keep the HAL TX bookkeeping from growing without bound */
+  sLowLevelOutput = gnetif.linkoutput;
+  gnetif.linkoutput = linkOutputAndRelease;
 /* USER CODE END 3 */
 }
 
@@ -147,10 +173,21 @@ static void Ethernet_Link_Periodic_Handle(struct netif *netif)
 void MX_LWIP_Process(void)
 {
 /* USER CODE BEGIN 4_1 */
+  sDiagT0 = DWT->CYCCNT;
 /* USER CODE END 4_1 */
   ethernetif_input(&gnetif);
 
 /* USER CODE BEGIN 4_2 */
+  { uint32_t t = DWT->CYCCNT; if (t - sDiagT0 > lwipDiagRxMax) lwipDiagRxMax = t - sDiagT0; sDiagT0 = t; }
+  /* RX DMA self-heal: after "receive buffer unavailable" (all RX descriptors were full, e.g.
+   * after a stall) the DMA stays suspended until the tail pointer is written again. The HAL
+   * only writes it when it rebuilds descriptors, so kick it here once they are refilled. */
+  if ((ETH->DMACSR & ETH_DMACSR_RBU) != 0U)
+  {
+    ETH->DMACSR = ETH_DMACSR_RBU;            /* write 1 to clear */
+    ETH->DMACRDTPR = ETH->DMACRDTPR;         /* re-write the tail pointer: resume RX DMA */
+    lwipRxDmaKicks++;
+  }
 /* USER CODE END 4_2 */
   /* Handle timeouts */
   sys_check_timeouts();
@@ -158,6 +195,7 @@ void MX_LWIP_Process(void)
   Ethernet_Link_Periodic_Handle(&gnetif);
 
 /* USER CODE BEGIN 4_3 */
+  { uint32_t t = DWT->CYCCNT - sDiagT0; if (t > lwipDiagTmrMax) lwipDiagTmrMax = t; }
 /* USER CODE END 4_3 */
 }
 

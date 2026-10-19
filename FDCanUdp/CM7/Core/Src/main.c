@@ -25,8 +25,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../../Common/Inc/ipc_log.h"
+#include "cm7_log.h"
+#include "udp_server.h"
+#include "../../../Common/Inc/wbc_protocol.h"
 #include "lwip/netif.h"
-#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -73,26 +75,25 @@ void PeriphCommonClock_Config(void);
 /* USER CODE BEGIN 0 */
 extern struct netif gnetif;   /* lwip.c */
 
+/* Main-loop timing (DWT cycles, 400 MHz): worst pass and worst MX_LWIP_Process() since the
+ * last [NET] line. Shows CPU stalls that let the 4 RX descriptors overflow (RBU). */
+static uint32_t loopMaxCyc, lwipMaxCyc;
+
 /* LED_UDP (LD2, PE1): network status
  *   off             Ethernet link down (no cable / PC port off)
- *   slow blink 1 Hz link up, no traffic from the PC
- *   fast blink 10Hz unicast packets from the PC in the last 200 ms (ping now, UDP commands later) */
+ *   slow blink 1 Hz link up, no valid command packets
+ *   fast blink 10Hz valid WBC command packets in the last 200 ms */
 static void udpLedUpdate(void)
 {
-  static uint32_t lastToggleMs, lastRxMs, lastRxCount;
+  static uint32_t lastToggleMs;
   uint32_t now = HAL_GetTick();
-  uint32_t rx  = ETH->MMCRUPGR;   /* MAC counter: good unicast packets received */
-  if (rx != lastRxCount)
-  {
-    lastRxCount = rx;
-    lastRxMs = now;
-  }
   if (!netif_is_link_up(&gnetif))
   {
     HAL_GPIO_WritePin(LED_UDP_GPIO_Port, LED_UDP_Pin, GPIO_PIN_RESET);
     return;
   }
-  uint32_t halfPeriod = (now - lastRxMs < 200U) ? 50U : 500U;
+  bool commands = udpStats.rxValid > 0U && (now - udpStats.lastRxMs) < 200U;
+  uint32_t halfPeriod = commands ? 50U : 500U;
   if (now - lastToggleMs >= halfPeriod)
   {
     lastToggleMs = now;
@@ -100,10 +101,43 @@ static void udpLedUpdate(void)
   }
 }
 
-/* Log sink: everything CM4 writes with LOG() goes out on USART3 (ST-LINK VCP) */
-static void uart3Out(const uint8_t* data, uint32_t len)
+/* Network status: immediately on link up/down, otherwise every 5 s. Shows where packets stop:
+ * MAC receiver on (re), RX DMA running (rxDma), RX DMA flags (RBU = no free receive buffer,
+ * RPS = receive process stopped, FBE = fatal bus error), and the MAC packet counters. */
+static void netStatusUpdate(void)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t*)data, (uint16_t)len, HAL_MAX_DELAY);
+  extern ETH_HandleTypeDef heth;   /* ethernetif.c */
+  extern volatile uint32_t ethRxAllocFail, ethRxBadBuff;
+  extern uint32_t ETH_RxPoolFree(void);
+  static uint32_t lastPrintMs;
+  static int lastLink = -1;
+  uint32_t now = HAL_GetTick();
+  int link = netif_is_link_up(&gnetif) ? 1 : 0;
+  if (link == lastLink && now - lastPrintMs < 5000U) return;
+  lastLink = link;
+  lastPrintMs = now;
+  uint32_t csr = ETH->DMACSR;
+  extern volatile uint32_t lwipDiagTxMax, lwipDiagRxMax, lwipDiagTmrMax, lwipRxDmaKicks;
+  CM7_LOG("[NET] link %s  rxUni %lu txGood %lu crcErr %lu  RBU %lu kicks %lu  pool %lu/12 allocFail %lu badBuff %lu  loop max %lu us (rx %lu, tmr %lu, tx %lu)  heth err 0x%lx",
+          link ? "UP" : "DOWN", ETH->MMCRUPGR, ETH->MMCTPCGR, ETH->MMCRCRCEPR,
+          (csr & ETH_DMACSR_RBU) ? 1UL : 0UL, lwipRxDmaKicks,
+          ETH_RxPoolFree(), ethRxAllocFail, ethRxBadBuff,
+          loopMaxCyc / 400U, lwipDiagRxMax / 400U, lwipDiagTmrMax / 400U, lwipDiagTxMax / 400U,
+          heth.ErrorCode);
+  loopMaxCyc = lwipMaxCyc = 0;
+  lwipDiagTxMax = lwipDiagRxMax = lwipDiagTmrMax = 0;
+}
+
+/* UDP statistics every 5 s, only while commands are arriving or right after they stop */
+static void udpStatsUpdate(void)
+{
+  static uint32_t lastPrintMs, lastRx;
+  uint32_t now = HAL_GetTick();
+  if (now - lastPrintMs < 5000U) return;
+  lastPrintMs = now;
+  if (udpStats.rxValid == lastRx && udpStats.rxBadSize == 0U && udpStats.rxBadMagic == 0U) return;
+  lastRx = udpStats.rxValid;
+  UDP_Server_PrintStats();
 }
 /* USER CODE END 0 */
 
@@ -137,6 +171,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  /* Instruction cache on: code is never written by DMA, so it needs no maintenance.
+   * The D-cache stays OFF (ETH buffers, SRAM4 mailboxes would need MPU/cache upkeep). */
+  SCB_EnableICache();
   /* Clear the CM4 log buffer before CM4 is released */
   IPC_LogInit();
   /* USER CODE END Init */
@@ -167,7 +204,18 @@ Error_Handler();
 /* USER CODE END Boot_Mode_Sequence_2 */
 
   /* USER CODE BEGIN SysInit */
+  /* Allocate D2 SRAM3 (0x30040000: Ethernet DMA descriptors, RX pool, LwIP heap) to CM7,
+   * as ST's H7 LwIP examples do. */
+  __HAL_RCC_D2SRAM3_CLK_ENABLE();
 
+  /* Initialise all of SRAM3 with 32-bit writes. Every H7 SRAM has ECC and holds random
+   * data + ECC after power-up; an 8/16-bit write does read-modify-write and faults
+   * (imprecise bus error) on a word that was never written in full. The Ethernet
+   * section is NOLOAD, so the startup code does not clear it, and lwIP writes 16-bit
+   * pbuf fields into each newly used RX buffer. Must run before MX_LWIP_Init(). */
+  for (volatile uint32_t* w = (volatile uint32_t*)0x30040000UL; w < (volatile uint32_t*)0x30048000UL; w++)
+    *w = 0U;
+  __DSB();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -175,11 +223,13 @@ Error_Handler();
   MX_USART3_UART_Init();
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
-  char banner[96];
-  int n = snprintf(banner, sizeof(banner),
-                   "\r\n=== CM7 up: SYSCLK %lu Hz, forwarding CM4 log ===\r\n",
-                   HAL_RCC_GetSysClockFreq());
-  uart3Out((const uint8_t*)banner, (uint32_t)n);
+  CM7_LOG("");
+  CM7_LOG("=== CM7 up: SYSCLK %lu Hz, forwarding CM4 log ===", HAL_RCC_GetSysClockFreq());
+  if (UDP_Server_Init())
+    CM7_LOG("[UDP] listening on 192.168.10.10:%u (command %u B, state %u B)",
+            WBC_UDP_PORT, (unsigned)sizeof(WbcCommandPacket), (unsigned)sizeof(WbcStatePacket));
+  else
+    CM7_LOG("[UDP] ERROR: could not open port %u", WBC_UDP_PORT);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -189,9 +239,16 @@ Error_Handler();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    MX_LWIP_Process();   /* Ethernet RX, LwIP timers, link state */
+    uint32_t t0 = DWT->CYCCNT;
+    MX_LWIP_Process();   /* Ethernet RX (UDP callbacks), LwIP timers, link state */
+    uint32_t t1 = DWT->CYCCNT;
     udpLedUpdate();
-    IPC_LogDrain(uart3Out);
+    udpStatsUpdate();
+    netStatusUpdate();
+    CM7_LogPump();       /* one log byte per pass, never blocks */
+    uint32_t t2 = DWT->CYCCNT;
+    if (t1 - t0 > lwipMaxCyc) lwipMaxCyc = t1 - t0;
+    if (t2 - t0 > loopMaxCyc) loopMaxCyc = t2 - t0;
   }
   /* USER CODE END 3 */
 }

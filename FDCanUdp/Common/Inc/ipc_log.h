@@ -30,6 +30,9 @@ void IPC_Printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 typedef void (*IPC_LogOut_t)(const uint8_t* data, uint32_t len);
 void IPC_LogDrain(IPC_LogOut_t out);
 
+/* CM7: take up to max bytes out of the buffer without blocking; returns the count. */
+uint32_t IPC_LogRead(uint8_t* dst, uint32_t max);
+
 #ifdef __cplusplus
 }
 #endif

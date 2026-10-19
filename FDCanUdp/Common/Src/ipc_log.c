@@ -69,6 +69,25 @@ void IPC_Printf(const char* fmt, ...)
     IPC_LogWrite(line, (uint32_t)n);
 }
 
+uint32_t IPC_LogRead(uint8_t* dst, uint32_t max)
+{
+    IpcLog_t* log = LOG_SHM;
+    if (log->magic != IPC_LOG_MAGIC)
+        return 0;
+
+    uint32_t head = log->head;
+    __DMB();   /* read head before the data it covers */
+    uint32_t tail = log->tail;
+    uint32_t n = head - tail;
+    if (n > max)
+        n = max;
+    for (uint32_t i = 0; i < n; i++)
+        dst[i] = log->buf[(tail + i) % IPC_LOG_SIZE];
+    __DMB();
+    log->tail = tail + n;
+    return n;
+}
+
 void IPC_LogDrain(IPC_LogOut_t out)
 {
     IpcLog_t* log = LOG_SHM;

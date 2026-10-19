@@ -153,7 +153,28 @@ lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
 void pbuf_free_custom(struct pbuf *p);
 
 /* USER CODE BEGIN 4 */
+/* RX path diagnostics (printed by CM7 main.c netStatusUpdate) */
+#include "lwip/priv/memp_priv.h"
+volatile uint32_t ethRxAllocFail;    /* RX pool empty when a descriptor needed a buffer */
+volatile uint32_t ethRxBadBuff;      /* RxLinkCallback got a buffer outside the RX pool */
+volatile uint32_t ethRxBadBuffAddr;  /* last such buffer address */
+volatile uint32_t ethRxBadDesc;      /* (RxDescIdx << 8) | RxBuildDescCnt at that moment */
 
+/* Number of free buffers in the zero-copy RX pool (walks the memp free list) */
+uint32_t ETH_RxPoolFree(void)
+{
+  uint32_t n = 0;
+  for (struct memp *m = *memp_RX_POOL.tab; m != NULL && n < 64U; m = m->next)
+    n++;
+  return n;
+}
+
+static int ethRxBuffValid(const uint8_t *buff)
+{
+  const uint8_t *base = memp_RX_POOL.base;
+  const uint8_t *end  = base + (uint32_t)memp_RX_POOL.num * memp_RX_POOL.size;
+  return buff >= base && buff < end;
+}
 /* USER CODE END 4 */
 
 /*******************************************************************************
@@ -723,6 +744,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   }
   else
   {
+    ethRxAllocFail++;
     RxAllocStatus = RX_ALLOC_ERROR;
     *buff = NULL;
   }
@@ -732,6 +754,16 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
 void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t Length)
 {
 /* USER CODE BEGIN HAL ETH RxLinkCallback */
+
+  /* Diagnostic guard: a buffer outside the RX pool (e.g. NULL = BackupAddr0 of a descriptor
+   * that was never refilled) would turn into a write to a wild address below. Record and skip. */
+  if (!ethRxBuffValid(buff))
+  {
+    ethRxBadBuff++;
+    ethRxBadBuffAddr = (uint32_t)buff;
+    ethRxBadDesc = (heth.RxDescList.RxDescIdx << 8) | (heth.RxDescList.RxBuildDescCnt & 0xFFU);
+    return;
+  }
 
   struct pbuf **ppStart = (struct pbuf **)pStart;
   struct pbuf **ppEnd = (struct pbuf **)pEnd;
@@ -763,8 +795,13 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
     p->tot_len += Length;
   }
 
-  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
-  SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
+  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale.
+   * Only when the D-cache is enabled: CM7 runs with the D-cache off and never initialises
+   * it, and invalidate-by-address on the uninitialised cache RAM raised imprecise bus
+   * faults here (CFSR 0x400) after the first few received frames. With the cache off the
+   * CPU reads the DMA data directly from SRAM, so no maintenance is needed. */
+  if (SCB->CCR & SCB_CCR_DC_Msk)
+    SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
 
 /* USER CODE END HAL ETH RxLinkCallback */
 }
@@ -772,9 +809,11 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 void HAL_ETH_TxFreeCallback(uint32_t * buff)
 {
 /* USER CODE BEGIN HAL ETH TxFreeCallback */
-
-  pbuf_free((struct pbuf *)buff);
-
+  /* Nothing to free: low_level_output() takes no pbuf reference and lwIP frees the pbuf
+   * itself after the blocking send (see lwip.c USER CODE 0). Never called with the blocking
+   * HAL_ETH_Transmit(); kept empty so a later switch to HAL_ETH_ReleaseTxPacket() cannot
+   * double-free. */
+  (void)buff;
 /* USER CODE END HAL ETH TxFreeCallback */
 }
 

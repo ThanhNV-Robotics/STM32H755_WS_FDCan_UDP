@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "cm7_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,7 +85,8 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  /* print fault type + crash address on the serial log (cm7_log.c) */
+  CM7_FaultDump("HardFault", __get_MSP());
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -99,7 +101,8 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  /* print fault type + crash address on the serial log (cm7_log.c) */
+  CM7_FaultDump("MemManage", __get_MSP());
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -114,7 +117,8 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  /* print fault type + crash address on the serial log (cm7_log.c) */
+  CM7_FaultDump("BusFault", __get_MSP());
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -129,7 +133,8 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  /* print fault type + crash address on the serial log (cm7_log.c) */
+  CM7_FaultDump("UsageFault", __get_MSP());
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {

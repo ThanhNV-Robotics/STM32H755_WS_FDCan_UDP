@@ -412,3 +412,80 @@ Newest entries at the bottom. Add one entry per work session: what changed, what
   - fast blink 10 Hz = unicast packets from the PC in the last 200 ms (MAC counter `ETH->MMCRUPGR`). After the UDP step this will mean valid command packets.
 - `CM4/.settings/stm32cubeide.project.prefs` untracked (committed before the ignore rule existed).
 - Verified on the board: slow blink when idle, fast blink while pinging.
+- Committed as `db87184`.
+
+### 2026-10-19 — UDP server on CM7 (design step 2)
+- `Common/Inc/wbc_protocol.h`: the packet layout from the design (command 256 B, state 224 B) as packed C structs with `_Static_assert` size checks. Shared by CM7, CM4 and the PC client.
+- `CM7/Core/Src/udp_server.c`: LwIP raw API (NO_SYS), port 9999. The receive callback runs inside `MX_LWIP_Process()`, checks length / magic / version, counts sequence gaps, and answers each valid command at once with one state packet to the sender. **States are placeholders in this step** (status bit `NO_CM4_DATA`, seq echoed, CM7 µs time); step 3 fills them from CM4.
+- `CM7/Core/Src/cm7_log.c`: **non-blocking serial log.** USART3 has no IRQ on CM7, so `CM7_LogPump()` (every main-loop pass) writes at most one byte when TXE is set. Sources: CM7's own `CM7_LOG()` queue first, then the CM4 log via the new `IPC_LogRead()`. Replaces the blocking `IPC_LogDrain()`, which stalled CM7 for up to 0.4 s.
+- CM7 `main.c`: `UDP_Server_Init()` after `MX_LWIP_Init()`, UDP stats every 5 s while commands arrive, LED fast blink now means **valid command packets** (ping alone gives slow blink).
+- `pc/wbc_udp_test.py`: sends commands at a fixed rate (default 500 Hz, 10 s), matches replies by seq, reports lost / late / bad, RTT avg/min/p50/p99/max and the PC's own send-period jitter. Never sets ENABLE unless `--enable`. `--rt` uses SCHED_FIFO (root). Tested against a local fake server.
+- First test on the board (`sudo python3 pc/wbc_udp_test.py --rate 250 --duration 10 --rt`): **0 of 2500 replies, and ping failed too**, although the log showed `[UDP] listening` and CM7's main loop was alive (still forwarding the CM4 log). Link up 100 Mbit/s, PC ARP entry STALE.
+  - Same symptom as the first ping (dead after flashing, worked after RESET). Two candidate causes: the debugger start after flashing leaves ETH/PHY in a bad state, or the RX DMA runs out of buffers after some traffic and stops (known weak spot of the CubeMX LwIP driver on the H7).
+  - Added `netStatusUpdate()` to CM7 `main.c`: a `[NET]` log line on every link change and every 5 s with MAC receiver on, RX DMA running, DMA flags RBU (no free RX buffer) / RPS (RX stopped) / FBE (bus error), MAC counters (unicast received, CRC errors, transmitted) and the HAL ETH state/error.
+  - `[NET]` result: receiver and RX DMA running, no DMA errors (RBU/RPS/FBE 0), no CRC errors; pings were received and answered (rxUni/txGood rose). **The log stops exactly when the UDP test starts**, and a live serial capture afterwards got 0 bytes in 16 s (normally a `[NET]` line every 5 s), with no debugger attached. → **CM7 crashes or hangs on the first UDP command packet**; pings alone are fine.
+  - Added fault reporting: CM7's HardFault/MemManage/BusFault/UsageFault handlers call `CM7_FaultDump()` (cm7_log.c), which prints the fault status registers (CFSR, HFSR, MMFAR, BFAR) and the stacked PC/LR with blocking UART writes. It finds the exception frame itself (Thumb bit in xPSR, PC in flash), because the handler's prologue size depends on the compiler.
+  - Fault caught (`[CM7] HardFault PC=0x08008502 LR=0x080023E3 CFSR=0x00000400 HFSR=0x40000000`): CFSR 0x400 = **imprecise bus error**, inside `HAL_ETH_RxLinkCallback()` (ethernetif.c), reached from `HAL_ETH_ReadData()`. The callback computes the pbuf from `buff − offsetof(RxBuff_t, buff)`; with `buff = BackupAddr0 = 0` (RX pool allocation failed) that writes to 0xFFFFFFE0.
+  - **Root cause found in the CubeMX NO_SYS port: TX descriptors are never released.** `low_level_output()` uses the blocking `HAL_ETH_Transmit()`, but nothing calls `HAL_ETH_ReleaseTxPacket()`. The HAL keeps `PacketAddress[]` set, so after `ETH_TX_DESC_CNT` = 4 frames every send fails with `HAL_ETH_ERROR_BUSY`. Explains: `txGood` stuck at 4–5, the first few pings answered then nothing, "works after RESET" briefly, the PC receiving nothing without errors.
+  - **Fix (USER CODE only, survives regeneration):**
+    - `lwip.c` USER CODE 0/3: wrap `gnetif.linkoutput`: call the generated `low_level_output()`, then `HAL_ETH_ReleaseTxPacket(&heth)`.
+    - `ethernetif.c` `HAL_ETH_TxFreeCallback`: no `pbuf_free()` anymore. `low_level_output()` takes no reference and lwIP frees the pbuf after the (blocking) send; freeing it in the callback would free every TX pbuf twice once the release works.
+  - The RX-pool exhaustion behind the crash is not explained yet by the TX bug alone; check whether the crash is gone after the TX fix (fault reporting stays in).
+  - **Result after the TX fix:** ping is now reliable (5/5, 0.19 ms; before: a few replies, then nothing). **UDP still crashes CM7 after 3 replies** (RTT about 220 µs): same HardFault, same place (`HAL_ETH_RxLinkCallback`, `buff = BackupAddr0 = 0`, CFSR 0x400). So there is a second, RX-side problem that shows with UDP (or with a high packet rate).
+
+### Where to continue (stopped 2026-10-19 ~02:00)
+- **Board state when stopped:** CM7 crashed (HardFault); needs a RESET before it answers on the network.
+- **Uncommitted** since `db87184`: UDP server, `wbc_protocol.h`, non-blocking CM7 log, `[NET]` status line, fault reporting, the TX-release fix, `pc/wbc_udp_test.py`, `pc/serial_log.sh`.
+- **Next experiments** (each needs a reset; asked the user whether I may reset via `STM32_Programmer_CLI` over SWD — no answer yet; a reset re-runs the CM4 benchmark, which enables the 12 motors at zero gains):
+  1. Fast ping (`ping -i 0.004`, 250/s): crash too → it is the packet rate, not UDP.
+  2. UDP packets of the wrong size to port 9999 (dropped without reply): crash → RX path; no crash → the reply path.
+  3. UDP at 5/s: separates packet count from rate.
+- Ideas to check: RX pool (12 buffers) consumption per packet (add counters in `HAL_ETH_RxAllocateCallback` / `pbuf_free_custom`), LwIP heap use by the reply (`MEM_SIZE` 8192 at 0x30045000), whether RX descriptors get corrupted (dump `heth.RxDescList` + `BackupAddr0` of all 4 descriptors in the fault handler), known CubeMX H7 issues around `ETH_UpdateDescriptor()` after `RX_ALLOC_ERROR`.
+- Still open from the design: what CM4 does when PC commands stop (damping / hold / disable).
+- Tools: `pc/serial_log.sh <name>` (log to `~/nucleo_<name>_MMDD_HHMM.txt`), `python3 pc/wbc_udp_test.py --rate 250|500 --duration N [--rt with sudo]`. I can also read the serial port directly (`stty -F /dev/ttyACM0 115200 raw; timeout N cat /dev/ttyACM0`) while running tests.
+
+### 2026-10-19 (later) — resumed
+- Motors are **not needed** for the UDP debugging (CM7 only). With the motor power off, CM4 finds 0 motors and enables nothing, so the board can be reset freely and the log stays quiet.
+- **Pitfall:** after power-on, the PC's wired port `enp1s0` was down (no carrier, no IP). Linux then routed 192.168.10.10 through **Wi-Fi via 192.168.1.1**, and another machine on that network answered pings (TTL 60, 1–160 ms) while the Nucleo log said `link DOWN`. Always check `ip -br addr show enp1s0` → `UP 192.168.10.1/24` and `ip route get 192.168.10.10` → `dev enp1s0`.
+- `pc/wbc_udp_test.py` now refuses to run unless the target is reached from a local 192.168.10.x address (prevents sending commands to a wrong host over Wi-Fi).
+
+### 2026-10-19 (afternoon) — UDP crash and stalls found and fixed; 5-minute soak clean
+Worked alone (user away; allowed to reset and flash via `STM32_Programmer_CLI` over SWD, motors powered off so resets are harmless). Every step: build CM7 by hand, flash only CM7's bank, reset, run tests while reading the serial port.
+
+**Root cause 1 — HardFault in `HAL_ETH_RxLinkCallback`: D-cache invalidate on an uninitialised cache.**
+- All crashes (CFSR 0x400, imprecise bus error) were inside `SCB_InvalidateDCache_by_Addr()` called by the RX link callback. Proven with `__DSB()` after every write in the callback: all passed, and the fault still fired at the `SCB->DCIMVAC` store itself.
+- CM7 runs with the D-cache **off** and never initialises it (normally `SCB_EnableDCache()` invalidates it first). Invalidate-by-address still looks up the cache tag RAM, which holds random data (with ECC) after power-up → bus error, at random moments depending on the buffer addresses.
+- **Fix** (`ethernetif.c`, USER CODE RxLinkCallback): invalidate only if `SCB->CCR & SCB_CCR_DC_Msk` (D-cache enabled). With the cache off the CPU reads DMA data directly from SRAM.
+- Hypotheses ruled out on the way: RX pool leak (pool stayed 8/12 free), SRAM ECC on uninitialised SRAM3 (zero-filling did not help), missing `D2SRAM3EN` (setting it did not help). Both of those are kept anyway as good practice: CM7 now sets `__HAL_RCC_D2SRAM3_CLK_ENABLE()` and zero-fills SRAM3 with 32-bit writes in USER CODE SysInit, before `MX_LWIP_Init()`.
+
+**Correction of yesterday's TX diagnosis.** The descriptors were *not* stuck after 4 frames: the HAL's BUSY check uses `PacketAddress[]`, which is always NULL with the blocking send. The early ping failures were root cause 1; ping passing 5/5 after the "TX fix" was luck.
+
+**Root cause 2 — growing stalls (lost / late replies after 10–20 s at 500 Hz).**
+- Measured per main-loop pass: one transmit grew from 20 µs to 2.5 ms, then stalls of 20 ms and 5–10 s; RX descriptors overflowed (`RBU 1`), the board missed thousands of commands (`seqGaps`).
+- Live read of `heth.TxDescList` over SWD: `BuffersInUse` grew by +1 per frame (2027 → 4053 → 6087 …), `PacketAddress[]` all NULL.
+- Cause: the blocking `HAL_ETH_Transmit()` never sets `TxDescList.CurrentPacketAddress` (only `HAL_ETH_Transmit_IT()` does), so `PacketAddress[]` stays NULL and `HAL_ETH_ReleaseTxPacket()` can never release anything, while `ETH_Prepare_Tx_Descriptors()` adds +1 per frame. My release wrapper called `ReleaseTxPacket()` after every frame, which loops `BuffersInUse` times.
+- **Fix** (`lwip.c`, USER CODE 0/3): the linkoutput wrapper now resets `heth.TxDescList.BuffersInUse = 0` after the blocking send instead of calling `ReleaseTxPacket()`. `HAL_ETH_TxFreeCallback` stays a no-op.
+
+**Robustness / speed additions:**
+- RX DMA self-heal (`lwip.c` USER CODE 4_2): if RBU is set, clear it and re-write the RX tail pointer (`lwipRxDmaKicks` counts it; 0 so far).
+- CM7 I-cache enabled (`SCB_EnableICache()` in USER CODE Init); D-cache stays off. Worst loop pass 353 → 225 µs.
+- One compact `[NET]` status line every 5 s: link, MAC counters, RBU/kicks, RX pool, worst loop/rx/timer/tx times, HAL error.
+- Kept: fault reporting (`CM7_FaultDump`), RX buffer guard in the link callback (counts and skips buffers outside the RX pool; 0 so far).
+
+**Results (motors off, PC without real-time priority):**
+
+| Test | Result |
+|---|---|
+| Ping 250/s | 500/500, 0.10 ms |
+| UDP 500 Hz, 30 s | 15 000/15 000, 0 lost, RTT avg 216 µs, p99 299 µs, max 732 µs |
+| **UDP 500 Hz, 5 min** | **150 000/150 000, 0 lost, 0 late**, RTT avg 226 µs, p99 330 µs |
+| UDP 250 Hz, 3 min | 44 999/45 000 (1 late reply: PC-side stall of 9.4 ms; the board answered all 45 000) |
+| Board over 195 000 packets | 0 seqGaps, 0 RBU, pool 8/12 steady, worst loop pass 300 µs, no faults |
+
+Board-side timings now flat: one send 30 µs, RX processing 76 µs, LwIP timers + PHY link check 144 µs (every 100 ms).
+
+### Where to continue
+- **Uncommitted** since `db87184`: everything from the UDP step (server, protocol header, CM7 log, fault reporting, the two Ethernet fixes, diagnostics) plus `pc/` scripts. Verified stable — ready to commit.
+- The board currently runs my hand-built CM7 image; the sources in the repo are identical, so a normal CubeIDE build + Run gives the same firmware (CubeIDE builds CM7 at `-O0`, as I did).
+- Next per the design: **step 3**, the CM7 ↔ CM4 mailboxes in SRAM4 (seqlock), then step 4, the CM4 control loop. Still needs the user's decision: what CM4 does when PC commands stop (damping / hold / disable).
+- For PC-side timing in real use, run the WBC process with real-time priority (`--rt` / SCHED_FIFO); the one late reply in the soak came from a 9 ms PC stall.
