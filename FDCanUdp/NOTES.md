@@ -489,3 +489,51 @@ Board-side timings now flat: one send 30 µs, RX processing 76 µs, LwIP timers 
 - The board currently runs my hand-built CM7 image; the sources in the repo are identical, so a normal CubeIDE build + Run gives the same firmware (CubeIDE builds CM7 at `-O0`, as I did).
 - Next per the design: **step 3**, the CM7 ↔ CM4 mailboxes in SRAM4 (seqlock), then step 4, the CM4 control loop. Still needs the user's decision: what CM4 does when PC commands stop (damping / hold / disable).
 - For PC-side timing in real use, run the WBC process with real-time priority (`--rt` / SCHED_FIFO); the one late reply in the soak came from a 9 ms PC stall.
+
+### 2026-10-20 — README
+- Pushed to GitHub after merging the remote commit `e541f4e` (separate UDP experiment from June) with `git merge -s ours` (`c70a272`): its history is kept, the tree is ours.
+- Added `README.md` at the repo root: target architecture, wiring, pin map, motor IDs and joint names, network, specifications (rates, CAN FD timing, MD80 frames), UDP packet layout, safety rules, design notes, layout, build/flash/run, status table.
+
+### 2026-10-20 — nucleotool step 1: CANdle emulation over UDP (replaces the CANdle hat)
+Goal (option A): the official CANdle-SDK `candletool` works through the Nucleo, for ping, CAN config, parameter config and calibration (no firmware update yet). Kept strictly apart from the control loop.
+
+**PC side** — `~/Documents/Programs/CANdle-SDK-udp` (local clone of the SDK, branch `nucleo-udp`):
+- New bus `mab::UDP` (`candlelib/src/communication_interface/UDP.hpp/.cpp`): one datagram per CANdle transfer, 4-byte tunnel header `[0xCD][bus|status][seq u16]`, replies with a wrong seq are dropped, timeout = CANdle timeout + 50 ms.
+- `busTypes_t::UDP`, wired into `attachCandle` / `CandleBuilder`. candletool `--bus UDP` (default), `--device L|R|<ip>:L|<ip>:R` (default L), `-d` default 8M. `--device` was never passed to the builder in upstream main.cpp; now it is.
+- Binary renamed **`nucleotool`** (installed `candletool` / `mdtool` untouched). Build: `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8`; run `build/candletool/nucleotool ...` (not installed).
+
+**Board side:**
+- `Common/Inc/tool_shm.h`: one-request mailbox in SRAM4 at `0x38004000` (after the log), CM4 mode flag, tunnel status codes. CM7 clears it before releasing CM4.
+- CM7 `tool_tunnel.c`: UDP port **9998**, own pcb (WBC server on 9999 untouched). Forwards a request only if CM4 reports MAINTENANCE and nothing is in flight; else answers `NOT_MAINTENANCE` / `BUSY` at once. Reply sent from `ToolTunnel_Poll()` in the main loop, never blocks. Logs `[TOOL] session from …` / `session end: N requests`.
+- CM4 `candle_emu.c`: RESET, DATARATE (reports CANdle fw 2.4.0 'N' so the SDK uses the packed API; anything but 8M FD → `ST_DATARATE`, nucleotool prints "use -d 8M"), CAN FRAME (sync, 66-byte reply), PACKED (up to 7 DTOs, CRC32 MPEG-2 checked and generated, per-frame timeout clamped to 100 ms). Accepts the first frame that comes back after the send.
+- CM4 mode: `CM4_BOOT_MODE` in `main.c` USER CODE PD. **Default now MAINTENANCE** (motors not touched; `CandleEmu_Poll()` in the loop). `TOOL_MODE_CONTROL` runs the bench as before and the tool is locked out. Runtime switching comes later with the control loop.
+- Manual build: new files added to `Debug/Core/Src/subdir.mk` and `Debug/objects.list` of both cores (CubeIDE regenerates these anyway).
+
+**Tests (motors off):**
+- `nucleotool candle version` → `CANdle firmware version: 2.4.0(N)` (L and `--device R`).
+- `-d 1M` refused with a clear message.
+- `md discover` ran 3809 requests in 20 s (no motors → all timeouts, 0 refused); CM7 loop max stayed ~220 µs, no RBU.
+
+- Tested with motors on (user): `nucleotool md discover` found all six left-leg drives (10 AK10-9, 20 MA-p-100-30, 30 AK70-10, 40 AK10-9, 50/60 AK60_6).
+- **Both legs by default** (UDP bus, no `--device`): `md discover` scans L then R with a `Leg L (FDCAN1):` / `Leg R (FDCAN2):` header (~21 s per leg); every `md -i <id> ...` command finds the leg itself (quiet probe on L, then R; prints `MD <id> is on leg X`). `--device L|R` still forces one leg. Needed `preBuildTask()` before the check: upstream parses `--bus`/`--device` only inside `build()`.
+- User test with motors on: two-leg `md discover` found all 12 (L 10–60, R 70–120; right leg has the same motor models per joint as the left), but took ~43 s.
+- **Discover 43 s → 10.4 s** (2026-10-21): `MD::discoverMDs` (candlelib) now waits 2 ms instead of the default 10 ms per probed id (an MD answers in ~0.2 ms at 8M); the timeout goes back to default once an MD is found. Still finds all 12. Per id now ≈ 2 ms + one UDP round trip for the CANdle version check in `MD::init`.
+- **Both legs in parallel** (2026-10-21): discover **10.4 s → 5.2 s**, all 12 found.
+  - Board: one mailbox slot per bus (`tool_shm.h`), CM7 tracks one request in flight per bus, CM4 `candle_emu.c` is now a non-blocking state machine per bus (send, then poll for reply/timeout each pass). Only runs in MAINTENANCE.
+  - PC: `md discover` (no `--device`) builds one Candle per leg and runs `MD::discoverMDs` in two threads with logging silenced, then prints the results per leg (`Leg L (FDCAN1):` …).
+- **Bus-off found and handled**: after a series of tests FDCAN2 was bus-off (CCCR.INIT=1, TEC 248, PSR.BO=1) and the right leg stayed dead until reset — nothing restarted the controller. `candle_emu.c` now checks INIT every pass and clears it (logs `[TOOL] leg X: bus-off …`). The control loop will need the same recovery. Cause of that bus-off unknown (possibly motor power switched while the bus was active); not seen again in 12 info runs.
+- **`md info` read ~74 registers as 0 — solved: SDK / MD firmware mismatch.** CANdle-SDK 1.5.1 (same version as the installed `candletool`) targets MD firmware 3.x (`isVersionAtLeast(fw, 3, 0, 0)` branches; register 0x02A was added to the SDK on 2026-06-26). Our drives run **2.4.0 (10, 30, 40, 70, 90, 100), 2.4.1 (50, 60, 110, 120), 2.5.4 (20, 80)**. Reading a register the drive does not have makes it stop answering for a few seconds (board and bus fine, other MDs answer), so every later read in `info` failed. Scanned all 95 readable SDK registers one by one: 12 are missing on 2.x — 0x02A mainEncoder, 0x02B mainEncoderDir, 0x200 torqueSensor, 0x201 torqueSensorData, 0x701 maxDriverCurrent, 0x7FB productionDate, 0x7FC productionBatch, 0x7FD uniqueID, 0x7FE hardwareRev, 0x7FF hardwareType, 0x813 miscStatus, 0x814 configStatus.
+  - Fix in candlelib `MD.hpp`: `MD::init` stores the firmware version; register reads/writes on firmware 2.x refuse those 12 addresses before sending (`Not available on MD firmware 2.4.0: …`). Covers `info`, `config download`, `register read/write`. Result: `info` on 10/70/120 with 0 failed reads and real values; all 12 still found afterwards.
+- `md info` now also prints a `[Controller gains]` section (position PID, velocity PID with windup, impedance kp/kd; registers 0x030–0x051, already read but never shown upstream). MD 10: pos kp 30 ki 0.5, vel kp 2 ki 0.5, impedance kp 150 kd 1.
+  - (Earlier note "fw 2.4.6" was a decoding mistake: 0x802 = 0x02040072 → 2.4.0.)
+- `md info` crashed (segfault) when the MD did not answer: upstream callback used `md` without a null check; fixed.
+- **nucleotool repo**: private GitHub repo https://github.com/ThanhNV-Robotics/nucleotool (local `~/Documents/Programs/CANdle-SDK-udp`, branch `main`; MAB's code on local branch `mab-main` / remote `mab-local`). README shortened to nucleotool only with a common-commands table (commit `f37e04a`, waiting for the user to push).
+- New `nucleotool md -i <id> encoder` (mdtool `encoder` equivalent): position/velocity/torque every 100 ms until Ctrl+C, register reads only (drive not enabled). mdtool `config zero` = `md -i <id> zero` (no save; `md -i <id> save` keeps it).
+- Fixed upstream bug in `MDCli::getMd`: `candle->init()` was called before the null check (crash when the connection fails); `build()` already runs `init()`.
+
+### Where to continue (stopped 2026-10-21)
+- **nucleotool done for now** (user: "the tool looks good"): discover both legs (5 s), info with gains, encoder, zero/save, register read/write, CAN config, calibration available. Repo https://github.com/ThanhNV-Robotics/nucleotool (private): 3 local commits not pushed yet (`git push` in `~/Documents/Programs/CANdle-SDK-udp`). `~/.local/bin/nucleotool` links to the build.
+- **Uncommitted in this repo:** README.md, NOTES.md, the board-side tool code (`Common/Inc/tool_shm.h`, CM7 `tool_tunnel.c/.h`, CM4 `candle_emu.c/.h`, both `main.c`, `Debug/*/subdir.mk` + `objects.list` edits). Board runs this firmware; CM4 boots in MAINTENANCE (bench only with `CM4_BOOT_MODE = TOOL_MODE_CONTROL`).
+- **Writes fixed (2026-10-21, late):** `md test relative` on MD 30 failed (`Error while transfering CAN frame`): SDK `MD::writeRegisters` sends 0x42, which fw 2.x silently ignores (same finding as on the board, see MD protocol notes). Now 0x40 on fw 2.x; verified with a read-back register write on MD 30. Before this, every write command (blink, zero, save, register write, can, calibration, test) silently failed. User confirmed `md test relative` moves MD 30 correctly through the board.
+- **Encoder caveat:** onboard encoder is single-turn on the rotor; after power-on the output position is right only within one rotor turn (9:1 → ±20°, 10:1 → ±18°, 6:1 → ±30°). Needs a known start pose, aux output encoders or homing; the control loop must refuse to enable if a joint is outside its start range.
+- **Next session (user's plan):** prepare a **ros2_control hardware interface** (`hardware_interface::SystemInterface`) on the PC that reads/writes the 12 motors through the board over UDP 9999 (`Common/Inc/wbc_protocol.h`: command pos/vel/tau/kp/kd, state pos/vel/tau/temperature/status). Board side still missing for that: CM7↔CM4 mailboxes and the CM4 control loop (CONTROL mode, runtime mode switch, timeout behaviour, bus-off recovery, start-range check).

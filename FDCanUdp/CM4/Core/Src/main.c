@@ -25,6 +25,8 @@
 /* USER CODE BEGIN Includes */
 #include "mab_md.h"
 #include "md_bench.h"
+#include "candle_emu.h"
+#include "../../../Common/Inc/tool_shm.h"
 #include "../../../Common/Inc/ipc_log.h"
 /* USER CODE END Includes */
 
@@ -47,6 +49,10 @@
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+
+/* Mode after boot. MAINTENANCE: buses idle, nucleotool (UDP 9998) may use them.
+ * CONTROL: the two-leg benchmark owns the buses, tool requests are refused. */
+#define CM4_BOOT_MODE TOOL_MODE_MAINTENANCE
 
 /* USER CODE END PD */
 
@@ -125,7 +131,17 @@ int main(void)
   static const uint16_t RIGHT_LEG_IDS[MD_MOTORS_PER_LEG] = {70, 80, 90, 100, 110, 120};
   MD_LegInit(&mdLegs[0], "L", &hfdcan1, LEFT_LEG_IDS);
   MD_LegInit(&mdLegs[1], "R", &hfdcan2, RIGHT_LEG_IDS);
-  MD_Bench_Setup();
+  if (CM4_BOOT_MODE == TOOL_MODE_CONTROL)
+  {
+    CandleEmu_SetMode(TOOL_MODE_CONTROL);
+    MD_Bench_Setup();
+  }
+  else
+  {
+    MD_PrintConfig();
+    LOG("[MODE] MAINTENANCE: motors not commanded, nucleotool may use the buses");
+    CandleEmu_SetMode(TOOL_MODE_MAINTENANCE);
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -139,7 +155,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    MD_Bench_Loop();
+    if (CM4_BOOT_MODE == TOOL_MODE_CONTROL)
+      MD_Bench_Loop();
+    else
+      CandleEmu_Poll();
   }
   /* USER CODE END 3 */
 }

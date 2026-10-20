@@ -32,3 +32,6 @@ Thumbs.db
 .vscode/
 # CubeIDE workspace data
 .metadata/
+
+# MAB legacy mdtool clone (reference only)
+FDCanUdp/mdtool/

@@ -27,6 +27,8 @@
 #include "../../../Common/Inc/ipc_log.h"
 #include "cm7_log.h"
 #include "udp_server.h"
+#include "tool_tunnel.h"
+#include "../../../Common/Inc/tool_shm.h"
 #include "../../../Common/Inc/wbc_protocol.h"
 #include "lwip/netif.h"
 /* USER CODE END Includes */
@@ -176,6 +178,7 @@ int main(void)
   SCB_EnableICache();
   /* Clear the CM4 log buffer before CM4 is released */
   IPC_LogInit();
+  ToolShm_Init();   /* nucleotool mailbox, also before CM4 runs */
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -230,6 +233,10 @@ Error_Handler();
             WBC_UDP_PORT, (unsigned)sizeof(WbcCommandPacket), (unsigned)sizeof(WbcStatePacket));
   else
     CM7_LOG("[UDP] ERROR: could not open port %u", WBC_UDP_PORT);
+  if (ToolTunnel_Init())
+    CM7_LOG("[TOOL] nucleotool tunnel on port %u", TOOL_UDP_PORT);
+  else
+    CM7_LOG("[TOOL] ERROR: could not open port %u", TOOL_UDP_PORT);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -245,6 +252,7 @@ Error_Handler();
     udpLedUpdate();
     udpStatsUpdate();
     netStatusUpdate();
+    ToolTunnel_Poll();   /* nucleotool replies from CM4, never blocks */
     CM7_LogPump();       /* one log byte per pass, never blocks */
     uint32_t t2 = DWT->CYCCNT;
     if (t1 - t0 > lwipMaxCyc) lwipMaxCyc = t1 - t0;
